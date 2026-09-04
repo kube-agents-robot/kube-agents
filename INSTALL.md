@@ -409,7 +409,7 @@ kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
 kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
 ```
 
-Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
+Vertex AI needs no entry here: `MODEL_PROVIDER=vertex_ai` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
 
 ### Step 3: Build & Push the Operator Image
