@@ -84,6 +84,32 @@ if ! grep -qE "\"${HOST_LABEL}\"[[:space:]]*=[[:space:]]*\"true\"" terraform/exa
   FAILED=1
 fi
 
+# --- Model provider values ------------------------------------------------
+# Ground truth: is_valid_model_provider in scripts/installer/installer_common.sh,
+# which every front door routes its check through. INSTALL.md told readers to
+# set MODEL_PROVIDER=vertex, which the validator rejects, so the install stopped
+# before it started for anyone who copied the line.
+MODEL_PROVIDERS=$(sed -n \
+  '/^is_valid_model_provider()/,/^}/s/.*=~ \^(\([^)]*\))\$.*/\1/p' \
+  scripts/installer/installer_common.sh)
+if [ -z "$MODEL_PROVIDERS" ]; then
+  echo "ERROR: could not read is_valid_model_provider from scripts/installer/installer_common.sh." >&2
+  exit 1
+fi
+
+# The trailing boundary keeps MODEL_PROVIDER=gemini from vouching for
+# MODEL_PROVIDER=gemini_flash. A document that has to show a *rejected* value —
+# in an error example, say — belongs in an exclusion here rather than reworded;
+# the point of the rule is that every provider name in the docs is one the
+# installer takes.
+WRONG_PROVIDER=$(search 'MODEL_PROVIDER=[A-Za-z0-9_]+' \
+  | grep -vE "MODEL_PROVIDER=(${MODEL_PROVIDERS})([^A-Za-z0-9_]|$)" || true)
+if [ -n "$WRONG_PROVIDER" ]; then
+  echo "::error::Documented MODEL_PROVIDER value is not one is_valid_model_provider accepts (${MODEL_PROVIDERS})."
+  printf '%s\n\n' "$WRONG_PROVIDER" | sed 's/^/    /'
+  FAILED=1
+fi
+
 # --- Go toolchain ---------------------------------------------------------
 # Ground truth: k8s-operator/go.mod
 GO_MOD_VERSION=$(awk '/^go /{print $2; exit}' k8s-operator/go.mod)
