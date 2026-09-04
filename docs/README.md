@@ -138,6 +138,7 @@ identifier appears, add its source here.
 | Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) |
 | A2A wire constants: protocol version, stream names, size thresholds, token grammar | `a2a/lib/envelope.go` and `a2a/lib/topics.go` |
 | Minimum supported tool versions (`gcloud`) | `scripts/installer/min_versions.sh` |
+| Accepted model-provider values (`MODEL_PROVIDER`, `--model-provider`, `litellm.modelProvider`, `model_provider`) | `scripts/installer/installer_common.sh` (`is_valid_model_provider`) |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
 | Cron job rosters and schedules | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |

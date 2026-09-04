@@ -84,6 +84,56 @@ if ! grep -qE "\"${HOST_LABEL}\"[[:space:]]*=[[:space:]]*\"true\"" terraform/exa
   FAILED=1
 fi
 
+# --- Model provider values ------------------------------------------------
+# Ground truth: is_valid_model_provider in scripts/installer/installer_common.sh,
+# which install.sh and scripts/installer/common.sh both route their check
+# through (upgrade.sh never reads the value). INSTALL.md told readers to set
+# MODEL_PROVIDER=vertex, which the validator rejects, so the install stopped
+# before it started for anyone who copied the line.
+MODEL_PROVIDERS=$(sed -n \
+  '/^is_valid_model_provider()/,/^}/s/.*=~ \^(\([^)]*\))\$.*/\1/p' \
+  scripts/installer/installer_common.sh)
+if [ -z "$MODEL_PROVIDERS" ]; then
+  echo "ERROR: could not read is_valid_model_provider from scripts/installer/installer_common.sh." >&2
+  exit 1
+fi
+
+# Every spelling that assigns a provider value in a line a reader can copy: the
+# environment variable, the installer flag, the chart value, and the Terraform
+# variable. The rule covers the assignment forms, not every mention — prose
+# naming MODEL_PROVIDER and the tables enumerating the whole accepted set
+# assign nothing, so a stale value there is out of reach on purpose.
+PROVIDER_ASSIGN='(MODEL_PROVIDER|--model-provider|modelProvider|model_provider)[[:space:]]*=[[:space:]]*"?'
+# Lowercase values only. Every accepted value is lowercase, and the placeholder
+# the docs put in the same position is not (`--model-provider=NAME`).
+PROVIDER_VALUE='[a-z0-9_]+'
+ACCEPTED_PROVIDER="${PROVIDER_ASSIGN}(${MODEL_PROVIDERS})([^a-z0-9_]|\$)"
+
+# Accepted assignments are deleted from each record before what is left is
+# re-tested, so one good value cannot vouch for a stale one further along the
+# same line — INSTALL.md:488 already names two providers in one sentence. The
+# trailing boundary keeps MODEL_PROVIDER=gemini from vouching for
+# MODEL_PROVIDER=gemini_flash. What the error prints is therefore each record
+# with its accepted assignments removed; the path:line anchor is intact. A
+# document that has to show a *rejected* value — in an error example, say —
+# belongs in an exclusion here rather than reworded.
+WRONG_PROVIDER=$(search "${PROVIDER_ASSIGN}${PROVIDER_VALUE}" \
+  | sed -E "s/${ACCEPTED_PROVIDER}/\3/g" \
+  | grep -E "${PROVIDER_ASSIGN}${PROVIDER_VALUE}" || true)
+if [ -n "$WRONG_PROVIDER" ]; then
+  echo "::error::Documented model provider value is not one is_valid_model_provider accepts (${MODEL_PROVIDERS}). Accepted assignments are stripped from the lines below."
+  printf '%s\n\n' "$WRONG_PROVIDER" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# A guard that passes because every copy disappeared is not a passing guard.
+PROVIDER_COPIES=$(search "${PROVIDER_ASSIGN}${PROVIDER_VALUE}" \
+  | grep -cE "${ACCEPTED_PROVIDER}" || true)
+if [ "${PROVIDER_COPIES:-0}" -lt 1 ]; then
+  echo "::error::No document assigns a model provider value any more; either restore one or drop this guard."
+  FAILED=1
+fi
+
 # --- Go toolchain ---------------------------------------------------------
 # Ground truth: k8s-operator/go.mod
 GO_MOD_VERSION=$(awk '/^go /{print $2; exit}' k8s-operator/go.mod)
