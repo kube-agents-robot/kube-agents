@@ -86,8 +86,9 @@ fi
 
 # --- Model provider values ------------------------------------------------
 # Ground truth: is_valid_model_provider in scripts/installer/installer_common.sh,
-# which every front door routes its check through. INSTALL.md told readers to
-# set MODEL_PROVIDER=vertex, which the validator rejects, so the install stopped
+# which install.sh and scripts/installer/common.sh both route their check
+# through (upgrade.sh never reads the value). INSTALL.md told readers to set
+# MODEL_PROVIDER=vertex, which the validator rejects, so the install stopped
 # before it started for anyone who copied the line.
 MODEL_PROVIDERS=$(sed -n \
   '/^is_valid_model_provider()/,/^}/s/.*=~ \^(\([^)]*\))\$.*/\1/p' \
@@ -97,16 +98,39 @@ if [ -z "$MODEL_PROVIDERS" ]; then
   exit 1
 fi
 
-# The trailing boundary keeps MODEL_PROVIDER=gemini from vouching for
-# MODEL_PROVIDER=gemini_flash. A document that has to show a *rejected* value —
-# in an error example, say — belongs in an exclusion here rather than reworded;
-# the point of the rule is that every provider name in the docs is one the
-# installer takes.
-WRONG_PROVIDER=$(search 'MODEL_PROVIDER=[A-Za-z0-9_]+' \
-  | grep -vE "MODEL_PROVIDER=(${MODEL_PROVIDERS})([^A-Za-z0-9_]|$)" || true)
+# Every spelling that assigns a provider value in a line a reader can copy: the
+# environment variable, the installer flag, the chart value, and the Terraform
+# variable. The rule covers the assignment forms, not every mention — prose
+# naming MODEL_PROVIDER and the tables enumerating the whole accepted set
+# assign nothing, so a stale value there is out of reach on purpose.
+PROVIDER_ASSIGN='(MODEL_PROVIDER|--model-provider|modelProvider|model_provider)[[:space:]]*=[[:space:]]*"?'
+# Lowercase values only. Every accepted value is lowercase, and the placeholder
+# the docs put in the same position is not (`--model-provider=NAME`).
+PROVIDER_VALUE='[a-z0-9_]+'
+ACCEPTED_PROVIDER="${PROVIDER_ASSIGN}(${MODEL_PROVIDERS})([^a-z0-9_]|\$)"
+
+# Accepted assignments are deleted from each record before what is left is
+# re-tested, so one good value cannot vouch for a stale one further along the
+# same line — INSTALL.md:488 already names two providers in one sentence. The
+# trailing boundary keeps MODEL_PROVIDER=gemini from vouching for
+# MODEL_PROVIDER=gemini_flash. What the error prints is therefore each record
+# with its accepted assignments removed; the path:line anchor is intact. A
+# document that has to show a *rejected* value — in an error example, say —
+# belongs in an exclusion here rather than reworded.
+WRONG_PROVIDER=$(search "${PROVIDER_ASSIGN}${PROVIDER_VALUE}" \
+  | sed -E "s/${ACCEPTED_PROVIDER}/\3/g" \
+  | grep -E "${PROVIDER_ASSIGN}${PROVIDER_VALUE}" || true)
 if [ -n "$WRONG_PROVIDER" ]; then
-  echo "::error::Documented MODEL_PROVIDER value is not one is_valid_model_provider accepts (${MODEL_PROVIDERS})."
+  echo "::error::Documented model provider value is not one is_valid_model_provider accepts (${MODEL_PROVIDERS}). Accepted assignments are stripped from the lines below."
   printf '%s\n\n' "$WRONG_PROVIDER" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# A guard that passes because every copy disappeared is not a passing guard.
+PROVIDER_COPIES=$(search "${PROVIDER_ASSIGN}${PROVIDER_VALUE}" \
+  | grep -cE "${ACCEPTED_PROVIDER}" || true)
+if [ "${PROVIDER_COPIES:-0}" -lt 1 ]; then
+  echo "::error::No document assigns a model provider value any more; either restore one or drop this guard."
   FAILED=1
 fi
 
