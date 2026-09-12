@@ -135,10 +135,12 @@ at a port-forward.
 Three of those are permanent - the callout, which cannot authenticate through itself;
 `web`, because a browser never can; and `sys`, which is a human rather than a workload -
 and the rest are waiting on something nameable. The single
-source for all of it - the config's static user blocks, the callout's map, and the
-`NATS_USER` a client is handed so it can set its inbox prefix - is
+source for all of it - the config's APP and `$SYS` static user blocks, the callout's map,
+and the `NATS_USER` a client is handed so it can set its inbox prefix - is
 `platformagent_a2a_identities.go`; before the callout those three lived in a config
-string, a Secret and a container env block with nothing but review connecting them.
+string, a Secret and a container env block with nothing but review connecting them. The
+one static block not in that file is the callout's own, rendered in the AUTH account
+template in `platformagent_a2a_manifests.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
