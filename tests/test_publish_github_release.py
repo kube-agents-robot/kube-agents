@@ -398,6 +398,7 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("Notes Start Tag:   none", proc.stdout)
+            self.assertIn(f"No GA tag below '{MOCK_TARGET_RELEASE_TAG}' in this checkout", proc.stderr)
             create_line = self._release_create_line(gh_log)
             self.assertIn("--generate-notes", create_line)
             self.assertNotIn("--notes-start-tag", gh_log.read_text())
