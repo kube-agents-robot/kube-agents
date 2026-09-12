@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"maps"
 	"net"
 	"path"
 	"reflect"
@@ -2871,6 +2872,402 @@ func TestWorkerGrantNamesStreamsTheProvisionScriptCreates(t *testing.T) {
 	for _, line := range strings.Split(script, "\n") {
 		if strings.Contains(line, "stream add ") && !strings.Contains(line, "--allow-direct") {
 			t.Errorf("provision line %q does not set --allow-direct; the worker's grant is written for DIRECT.GET, not STREAM.MSG.GET", strings.TrimSpace(line))
+		}
+	}
+}
+
+// a2aGrantStream maps one JetStream or KV grant to the stream it names.
+//
+// stream is the stream a per-stream grant reaches ($JS.API.STREAM.<verb>.<s>,
+// $JS.API.CONSUMER.<verb>.<s>..., $JS.API.CONSUMER.MSG.NEXT.<s>...,
+// $JS.API.DIRECT.GET.<s>..., $JS.ACK.<s>...; a $KV.<b>.> grant names the
+// bucket's backing stream, KV_<b>). accountLevel is true for the three
+// discovery requests that name no stream at all. Both zero means the shape is
+// not one this helper knows, and the invariant test fails on that rather than
+// letting a new verb through unread: a grant the helper cannot place is a grant
+// nobody has argued about yet.
+//
+// A wildcard where the stream name should be comes back as the wildcard itself,
+// so "$JS.API.STREAM.INFO.*" maps to stream "*", which is a member of no row.
+func a2aGrantStream(subject string) (stream string, accountLevel bool) {
+	tok := strings.Split(subject, ".")
+	at := func(i int) string {
+		if i < len(tok) {
+			return tok[i]
+		}
+		return ""
+	}
+	switch {
+	case at(0) == "$KV":
+		// $KV.<bucket>.>: the bucket is a stream called KV_<bucket>.
+		if b := at(1); b != "" {
+			if b == "*" || b == ">" {
+				return b, false
+			}
+			return a2aKVStreamPrefix + b, false
+		}
+		return "", false
+
+	case at(0) == "$JS" && at(1) == "ACK":
+		return at(2), false
+
+	case at(0) == "$JS" && at(1) == "API":
+		switch {
+		case subject == "$JS.API.INFO",
+			subject == "$JS.API.STREAM.NAMES",
+			subject == "$JS.API.STREAM.LIST":
+			return "", true
+		case at(2) == "STREAM" && at(3) == "MSG" && (at(4) == "GET" || at(4) == "DELETE"):
+			return at(5), false
+		case at(2) == "STREAM" && slices.Contains([]string{
+			"CREATE", "UPDATE", "DELETE", "INFO", "PURGE", "RESTORE", "SNAPSHOT"}, at(3)):
+			// One trailing token exactly: a stream's own verbs take the
+			// stream name and nothing after it.
+			if len(tok) != 5 {
+				return "", false
+			}
+			return at(4), false
+		case at(2) == "CONSUMER" && at(3) == "MSG" && at(4) == "NEXT":
+			return at(5), false
+		case at(2) == "CONSUMER" && at(3) == "DURABLE" && at(4) == "CREATE":
+			return at(5), false
+		case at(2) == "CONSUMER" && slices.Contains([]string{
+			"CREATE", "INFO", "DELETE", "NAMES", "LIST"}, at(3)):
+			return at(4), false
+		case at(2) == "DIRECT" && at(3) == "GET":
+			return at(4), false
+		}
+	}
+	return "", false
+}
+
+func TestA2AGrantStream(t *testing.T) {
+	cases := []struct {
+		subject      string
+		stream       string
+		accountLevel bool
+	}{
+		{"$JS.API.INFO", "", true},
+		{"$JS.API.STREAM.NAMES", "", true},
+		{"$JS.API.STREAM.LIST", "", true},
+		{"$JS.API.STREAM.CREATE.TASKS", "TASKS", false},
+		{"$JS.API.STREAM.INFO.KV_cap", "KV_cap", false},
+		{"$JS.API.STREAM.MSG.GET.TASKS", "TASKS", false},
+		{"$JS.API.CONSUMER.CREATE.TASKS.>", "TASKS", false},
+		{"$JS.API.CONSUMER.INFO.DIRECTORY.*", "DIRECTORY", false},
+		{"$JS.API.CONSUMER.DELETE.KV_runtime-state.*", "KV_runtime-state", false},
+		{"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*", "TOPICS-STATE", false},
+		{"$JS.API.CONSUMER.DURABLE.CREATE.TASKS.x", "TASKS", false},
+		{"$JS.API.DIRECT.GET.TOPICS-JOURNAL.>", "TOPICS-JOURNAL", false},
+		{"$JS.ACK.TASKS.>", "TASKS", false},
+		{"$KV.session-state.>", "KV_session-state", false},
+		// Wildcards in the stream position come back as themselves, so
+		// they match no row.
+		{"$JS.API.STREAM.INFO.*", "*", false},
+		{"$JS.API.CONSUMER.CREATE.>", ">", false},
+		{"$JS.ACK.>", ">", false},
+		{"$KV.>", ">", false},
+		// Shapes the helper does not know: neither a stream nor
+		// account-level, which the invariant test reads as a failure.
+		{"$JS.API.>", "", false},
+		{"$JS.API.STREAM.>", "", false},
+		{"$JS.API.STREAM.INFO", "", false},
+		{"$JS.API.STREAM.INFO.TASKS.x", "", false},
+		{"$JS.API.SERVER.INFO", "", false},
+		{"$JS.FC.>", "", false},
+		{"a2a.tasks.>", "", false},
+	}
+	for _, c := range cases {
+		stream, accountLevel := a2aGrantStream(c.subject)
+		if stream != c.stream || accountLevel != c.accountLevel {
+			t.Errorf("a2aGrantStream(%q) = (%q, %v), want (%q, %v)",
+				c.subject, stream, accountLevel, c.stream, c.accountLevel)
+		}
+	}
+}
+
+// a2aConfUserNames returns every `user:` name in a nats.conf render, in order.
+// A trimmed line beginning with the key, so a comment that mentions a user
+// does not count as one.
+func a2aConfUserNames(conf string) []string {
+	var names []string
+	for _, line := range strings.Split(conf, "\n") {
+		if name, ok := strings.CutPrefix(strings.TrimSpace(line), "user: "); ok {
+			names = append(names, strings.TrimSpace(name))
+		}
+	}
+	return names
+}
+
+// a2aConfUserBlock returns one user's block: from its `user:` line to the brace
+// that closes the block, at the column renderA2AStaticUser and the AUTH
+// template both put it. Not the span to the next `user:` line, which
+// a2aGrantSubjects uses: that span runs on through the comment above the next
+// block, and for the last user in the file through the authorization section.
+func a2aConfUserBlock(t *testing.T, conf, user string) string {
+	t.Helper()
+	start := strings.Index(conf, "user: "+user+"\n")
+	if start < 0 {
+		t.Fatalf("no %s user in the rendered config", user)
+	}
+	end := strings.Index(conf[start:], "\n"+a2aUserBlockIndent+"}\n")
+	if end < 0 {
+		t.Fatalf("%s's user block is unterminated", user)
+	}
+	return conf[start : start+end]
+}
+
+// a2aPodSpecEnvSecretKeys returns every (secret, key) an env var in the pod
+// spec reads by SecretKeyRef, across containers and init containers.
+func a2aPodSpecEnvSecretKeys(spec corev1.PodSpec) []string {
+	var refs []string
+	for _, c := range slices.Concat(spec.InitContainers, spec.Containers) {
+		for _, e := range c.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+				refs = append(refs, c.Name+"/"+e.Name+"="+e.ValueFrom.SecretKeyRef.Name+":"+e.ValueFrom.SecretKeyRef.Key)
+			}
+		}
+		for _, ef := range c.EnvFrom {
+			if ef.SecretRef != nil {
+				refs = append(refs, c.Name+"/envFrom="+ef.SecretRef.Name+":*")
+			}
+		}
+	}
+	return refs
+}
+
+// The deployment spec states one property for every user (spec-nats-deployment
+// §Layout): deny by default, the JetStream API enumerated per stream and per
+// verb, ack grants per stream, topic publishes exact, one inbox prefix per
+// user. Four fixes each narrowed one user and each left a test for that user;
+// this is the same property asked of every user in the rendered nats.conf, so
+// a grant widened on a user nobody has fixed yet, or a new user added to
+// a2aIdentities, fails here rather than waiting for its own incident.
+//
+// Against the render rather than the identity structs, because the render is
+// what the server reads: a user the identities tests never see (callout, in
+// the AUTH template) still appears here, and a rendering bug that dropped a
+// list would too.
+//
+// The table is the record of what each user may reach. Adding a stream, a
+// verb or a user is expected to fail this test once, and the failure names
+// the row or helper case to add; that one red is the review the widening
+// gets.
+func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
+	agent := a2aTestAgent()
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+
+	const (
+		bareJetStreamAPI = "$JS.API.>"
+		flowControl      = "$JS.FC.>"
+		inboxPrefix      = "_INBOX."
+		topicsPrefix     = "a2a.topics."
+		sysUser          = "sys"
+	)
+
+	// One row per APP user. streams is every stream the user's grants may
+	// name, in either list, and it is checked in both directions: a grant
+	// naming a stream outside the row fails, and a row entry no grant
+	// touches fails, so the row cannot drift wider than the user.
+	// accountLevel is the $JS.API discovery the user may make with no stream
+	// in the subject. wholesale records the one user that still holds
+	// $JS.API.>; narrowing it is a behaviour change with its own real-server
+	// test, not this table's to make.
+	kvSessionState := a2aKVStreamPrefix + "session-state"
+	rows := map[string]struct {
+		streams      []string
+		accountLevel []string
+		wholesale    bool
+	}{
+		"gateway": {
+			streams:   []string{a2aTasksStream, kvSessionState},
+			wholesale: true,
+		},
+		"worker": {
+			streams: []string{a2aTasksStream, a2aKVStreamPrefix + a2aRuntimeStateBucket, a2aTopicsStateStream, a2aTopicsJournalStream},
+		},
+		"seed": {
+			// a2aSeedJetStreamGrants enumerates CREATE and INFO over the
+			// whole provisioned list, buckets included.
+			streams:      a2aProvisionedStreams,
+			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES"},
+		},
+		"web": {
+			streams:      []string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
+			accountLevel: []string{"$JS.API.INFO"},
+		},
+	}
+	for user, row := range rows {
+		for _, s := range row.streams {
+			if !slices.Contains(a2aProvisionedStreams, s) {
+				t.Errorf("row %s names stream %q, which a2aProvisionedStreams does not; the table follows the provisioner, not the other way round", user, s)
+			}
+		}
+	}
+
+	// 6a. The users in the render are exactly the table's, plus the two the
+	// table does not run: sys ($SYS holds no subject lists) and callout (the
+	// AUTH account's one user, asserted on its own below).
+	wantUsers := slices.Sorted(maps.Keys(rows))
+	wantUsers = append(wantUsers, a2aCalloutConfUser, sysUser)
+	slices.Sort(wantUsers)
+	gotUsers := a2aConfUserNames(conf)
+	slices.Sort(gotUsers)
+	if !slices.Equal(gotUsers, wantUsers) {
+		t.Fatalf("nats.conf users = %v, want %v; a new user needs a row in this test's table before it ships, and a row with no user is stale", gotUsers, wantUsers)
+	}
+
+	// 6b. sys is the only user in $SYS, and it carries no permissions block:
+	// the system account's own privileges are what it holds, and an allow
+	// list would only narrow them into something that looks like a grant.
+	sysStart := strings.Index(conf, "\n  SYS {")
+	sysEnd := strings.Index(conf, "\nsystem_account:")
+	if sysStart < 0 || sysEnd < sysStart {
+		t.Fatal("cannot find the SYS account block in the rendered config")
+	}
+	if got := a2aConfUserNames(conf[sysStart:sysEnd]); !slices.Equal(got, []string{sysUser}) {
+		t.Errorf("SYS account users = %v, want [%s]; no agent authenticates into the system account", got, sysUser)
+	}
+	if block := a2aConfUserBlock(t, conf, sysUser); strings.Contains(block, "permissions {") {
+		t.Errorf("sys carries a permissions block:\n%s", block)
+	}
+
+	// 6c. The sys password is the operator's, not a workload's: no rendered
+	// pod reads it into an env var, by key or by importing the whole creds
+	// Secret.
+	for name, spec := range map[string]corev1.PodSpec{
+		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
+		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
+		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
+	} {
+		for _, ref := range a2aPodSpecEnvSecretKeys(spec) {
+			if strings.HasSuffix(ref, ":"+a2aSysPasswordKey) || strings.HasSuffix(ref, ":*") {
+				t.Errorf("%s env %s reaches the %s key; the $SYS credential is for a person with a port-forward", name, ref, a2aSysPasswordKey)
+			}
+		}
+	}
+
+	// callout: the AUTH account's one user, whose grant pair is rendered on
+	// one line each and so never reaches a2aGrantSubjects. Asserted exactly:
+	// read the authorization requests, answer them, nothing else.
+	calloutBlock := a2aConfUserBlock(t, conf, a2aCalloutConfUser)
+	for _, want := range []string{
+		`subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }`,
+		`publish { allow = [ "$SYS._INBOX.>" ] }`,
+	} {
+		if !strings.Contains(calloutBlock, want) {
+			t.Errorf("callout lacks %s:\n%s", want, calloutBlock)
+		}
+	}
+	if n := strings.Count(calloutBlock, "allow"); n != 2 {
+		t.Errorf("callout's block has %d allow lists, want exactly 2:\n%s", n, calloutBlock)
+	}
+
+	// The wholesale grant: exactly the users the table records, and today
+	// that is gateway alone.
+	var wantWholesale, gotWholesale []string
+	for user, row := range rows {
+		if row.wholesale {
+			wantWholesale = append(wantWholesale, user)
+		}
+		for _, section := range []string{"publish", "subscribe"} {
+			if slices.Contains(a2aGrantSubjects(t, conf, user, section), bareJetStreamAPI) && !slices.Contains(gotWholesale, user) {
+				gotWholesale = append(gotWholesale, user)
+			}
+		}
+	}
+	slices.Sort(wantWholesale)
+	slices.Sort(gotWholesale)
+	if !slices.Equal(gotWholesale, []string{"gateway"}) || !slices.Equal(wantWholesale, gotWholesale) {
+		t.Errorf("users holding %s = %v, want [gateway] (the one recorded exception; the table says %v)", bareJetStreamAPI, gotWholesale, wantWholesale)
+	}
+
+	// 1 to 5, per user, per list.
+	unscoped := []string{">", "*", "$JS.>", "$JS.ACK.>", "$KV.>"}
+	for _, user := range slices.Sorted(maps.Keys(rows)) {
+		row := rows[user]
+		ownInbox := inboxPrefix + user + ".>"
+		named := map[string]bool{}
+
+		for _, section := range []string{"publish", "subscribe"} {
+			// 1. a2aGrantSubjects fails on a missing or empty list.
+			grants := a2aGrantSubjects(t, conf, user, section)
+
+			var inboxes []string
+			for _, g := range grants {
+				// 2. Nothing unscoped, and the wholesale grant only where
+				// the table records it.
+				if slices.Contains(unscoped, g) {
+					t.Errorf("%s %s holds unscoped %q", user, section, g)
+					continue
+				}
+				if g == bareJetStreamAPI {
+					if !row.wholesale {
+						t.Errorf("%s %s holds %s, which the table does not record for it", user, section, g)
+					}
+					continue
+				}
+
+				// 4. Inbox entries, collected and checked below.
+				if strings.HasPrefix(g, inboxPrefix) {
+					inboxes = append(inboxes, g)
+					if g != ownInbox {
+						t.Errorf("%s %s holds inbox grant %q; the only inbox a user may name is %s", user, section, g, ownInbox)
+					}
+					continue
+				}
+
+				// 5. A topic publish is a literal subject: the topic's
+				// writer and its subject list travel together, and a
+				// wildcard would make the writerless probe writable.
+				if section == "publish" && strings.HasPrefix(g, topicsPrefix) && strings.ContainsAny(g, "*>") {
+					t.Errorf("%s publish holds topic wildcard %q; topic publishes are exact", user, g)
+					continue
+				}
+
+				// 3. Every JetStream and KV grant names a stream in the
+				// row, or is account-level discovery the row allows.
+				isJS := strings.HasPrefix(g, "$JS.")
+				isKV := strings.HasPrefix(g, "$KV.")
+				if !isJS && !isKV {
+					continue
+				}
+				if g == flowControl {
+					// Push flow control's reply subject, neither API
+					// nor ACK, and the only $JS. entry outside those.
+					continue
+				}
+				if isJS && !strings.HasPrefix(g, "$JS.API.") && !strings.HasPrefix(g, "$JS.ACK.") {
+					t.Errorf("%s %s holds %q, a $JS. subject that is neither API nor ACK nor %s", user, section, g, flowControl)
+					continue
+				}
+				stream, accountLevel := a2aGrantStream(g)
+				switch {
+				case accountLevel:
+					if !slices.Contains(row.accountLevel, g) {
+						t.Errorf("%s %s holds account-level %q, which its row does not allow", user, section, g)
+					}
+				case stream == "":
+					t.Errorf("%s %s holds %q, a shape a2aGrantStream cannot place; a new verb needs a case there, and an argument", user, section, g)
+				case !slices.Contains(row.streams, stream):
+					t.Errorf("%s %s holds %q, which names stream %q outside its row %v", user, section, g, stream, row.streams)
+				default:
+					named[stream] = true
+				}
+			}
+
+			// 4. One inbox prefix per user, in each list.
+			if !slices.Equal(inboxes, []string{ownInbox}) {
+				t.Errorf("%s %s inbox grants = %q, want exactly [%s]", user, section, inboxes, ownInbox)
+			}
+		}
+
+		// The row's other direction: a stream nothing names is a stale
+		// row, and a stale row is a grant waiting to be added unreviewed.
+		for _, s := range row.streams {
+			if !named[s] {
+				t.Errorf("row %s names stream %q that no grant of %s reaches; drop it from the row", user, s, user)
+			}
 		}
 	}
 }
