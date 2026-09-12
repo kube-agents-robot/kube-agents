@@ -208,7 +208,7 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 //
 // The watch call is the recovery signal rather than the list because it is
 // the last request the reflector makes before events flow, whichever mode it
-// is in. Under client-go's WatchListClient feature, on by default since 0.37,
+// is in. Under client-go's WatchListClient feature, on by default since 0.35,
 // a recovered reflector streams its initial state through the watch call and
 // may never call List at all; and in the classic mode an identity that may
 // list but not watch would otherwise read as up for the instant between each

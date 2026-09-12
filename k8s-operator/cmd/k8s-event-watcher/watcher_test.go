@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -543,5 +544,101 @@ func TestWatcher_SuccessfulListEndsTheHoldWithoutReporting(t *testing.T) {
 	w.handleWatchError(cancelled, nil, forbiddenWatchErr)
 	if got, want := rec.snapshot(), []bool{true, false}; !equalBools(got, want) {
 		t.Errorf("transitions across two list-then-refused-watch cycles = %v; want %v", got, want)
+	}
+}
+
+// watchListCapableClient hides the fake clientset's
+// IsWatchListSemanticsUnSupported marker. The reflector reads that marker
+// through ToListWatcherWithWatchListSemantics and, when it is present, runs in
+// the classic list-then-watch mode; without it the reflector takes the
+// watch-list path a real client gets by default, streaming the initial state
+// through the watch call and never calling List while the watch is permitted.
+type watchListCapableClient struct{ kubernetes.Interface }
+
+// initialEventsEndBookmark is the bookmark an API server sends once the
+// watch-list stream has delivered the initial state; the reflector completes
+// its sync on it.
+func initialEventsEndBookmark() *corev1.Event {
+	return &corev1.Event{ObjectMeta: metav1.ObjectMeta{
+		ResourceVersion: "1",
+		Annotations:     map[string]string{metav1.InitialEventsAnnotationKey: "true"},
+	}}
+}
+
+// The same sequence as TestRun_ForbiddenWatchAfterSyncReportsDownThenUp, in
+// the watch-list reflector mode production runs in: the initial sync arrives
+// through the watch call with no List at all, a refused watch after the sync
+// is held and reported false, and the recovery is the next watch call that
+// succeeds, again with no List between the hold and it. The last call before
+// the recovering watch is the refused watch, which is what makes the watch
+// call, not the list, the signal newListWatch hooks.
+func TestRun_WatchListMode_ForbiddenWatchAfterSyncReportsDownThenUp(t *testing.T) {
+	captureLog(t)
+	underlying := fake.NewClientset()
+	var refuse atomic.Bool
+	var listAttempts, watchAttempts atomic.Int64
+	var lastCall atomic.Value
+	var callBeforeRecovery atomic.Value
+	var openWatch atomic.Pointer[watch.FakeWatcher]
+	underlying.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		listAttempts.Add(1)
+		lastCall.Store("list")
+		return false, nil, nil
+	})
+	underlying.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		watchAttempts.Add(1)
+		if refuse.Load() {
+			lastCall.Store("refused watch")
+			return true, nil, forbiddenWatchErr
+		}
+		if prev, ok := lastCall.Load().(string); ok && prev == "refused watch" {
+			callBeforeRecovery.Store(prev)
+		}
+		lastCall.Store("watch")
+		fw := watch.NewFakeWithChanSize(1, false)
+		fw.Action(watch.Bookmark, initialEventsEndBookmark())
+		openWatch.Store(fw)
+		return true, fw, nil
+	})
+	w := newWatcher(watchListCapableClient{underlying}, nopDispatcher{}, targetCluster{Name: "streamed"}, 0)
+	w.forbiddenHold = 200 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 1 }, "the sync to be reported")
+	if got, want := rec.snapshot(), []bool{true}; !equalBools(got, want) {
+		t.Fatalf("transitions after the sync = %v; want %v", got, want)
+	}
+	if got := listAttempts.Load(); got != 0 {
+		t.Fatalf("the reflector listed %d time(s) before the sync; want 0 in watch-list mode (is the fake still reporting itself unsupported?)", got)
+	}
+
+	// Revoke: close the stream so the reflector re-opens the watch, and refuse
+	// it from now on.
+	refuse.Store(true)
+	openWatch.Swap(nil).Stop()
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 2 }, "the drop to be reported")
+	if got, want := rec.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Fatalf("transitions after the refused watch = %v; want %v", got, want)
+	}
+
+	refuse.Store(false)
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 3 }, "the recovery to be reported")
+	if got, want := rec.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
+		t.Fatalf("transitions after the grant = %v; want %v", got, want)
+	}
+	if got, _ := callBeforeRecovery.Load().(string); got != "refused watch" {
+		t.Errorf("the call before the recovering watch was %q; want the refused watch, with no List between the hold and the recovery", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
 	}
 }
