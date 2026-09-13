@@ -43,6 +43,12 @@ CRASHLOOP_TRIO = [
 # 2026-09-08 12:00Z is 08:00 ET (EDT); the outage began 09-08 09:00Z = 5:00 AM ET.
 NOW = "2026-09-08T14:30:00+00:00"
 OUTAGE_SINCE = "2026-09-08T09:00:00+00:00"
+# The later of the fixture's two setup deaths after SETUP_DEATHS_SINCE: PR
+# 1274, finished 09-08 10:39:30Z = Tue 6:39 AM ET.
+SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
+SETUP_DEATH_BUILD = "2097273589702070272"
+SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
+HOSTILE_PR = "<<script>script>"
 
 
 def health_doc(state="OUTAGE", **overrides):
@@ -432,6 +438,7 @@ class RenderedFilesTest(unittest.TestCase):
         self.assertNotIn("index.html?", script)
         self.assertEqual(script.count("new Intl.DateTimeFormat"), 1, "one place a time becomes text")
         self.assertNotIn("toISOString().slice(11, 16)", script, "no UTC clock text on the new pages")
+        self.assertNotIn("replace(/<[^>]+>/g", script, "text is escaped once, never rendered as markup and stripped back (CodeQL alert 30)")
 
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
@@ -501,10 +508,27 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Retest after Tue 10:30 AM ET", app)
 
     def test_setup_deaths_brief(self):
-        app = self.render_state(health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], tracking_issues=[], since="2026-09-07T15:00:00+00:00"), "setup")
+        app = self.render_state(health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], tracking_issues=[], since=SETUP_DEATHS_SINCE), "setup")
         self.assertIn("Runs are dying before any case runs", app)
         self.assertIn("Why we think it's the setup, not the PRs", app)
         self.assertIn("died within 5 minutes", app)
+
+    def test_setup_deaths_evidence_link_is_plain_text(self):
+        # The evidence anchor's text is the PR label escaped once, not a
+        # rendered prLink with its tags stripped back off (CodeQL alert 30):
+        # no anchor nested in the anchor, and a hostile PR value stays text.
+        health = health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], tracking_issues=[], since=SETUP_DEATHS_SINCE)
+        app = self.render_state(health, "setup-link")
+        match = re.search(r'The build log is the evidence: <a href="([^"]*)">([^<]*)</a>\.', app)
+        self.assertTrue(match, app)
+        self.assertIn(f"/1274/{SETUP_DEATH_BUILD}", match.group(1))
+        self.assertEqual(match.group(2), SETUP_DEATH_LABEL)
+        hostile = json.loads(json.dumps(self.data))
+        next(r for r in hostile["runs"] if r["build_id"] == SETUP_DEATH_BUILD)["pr"] = HOSTILE_PR
+        out = render_to(pathlib.Path(self.tmp.name) / "setup-hostile", hostile, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn(f"PR #{html.escape(HOSTILE_PR)} at Tue 6:39 AM ET", app)
+        self.assertNotIn("<script", app)
 
     def test_lost_pods_banner_and_window(self):
         # A build-cluster node loss (#1478): the run page's banner names it

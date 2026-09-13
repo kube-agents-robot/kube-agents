@@ -280,7 +280,8 @@ const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
 
-const prLink = (pr) => (pr == null ? "no PR" : `<a href="${PAGE.prUrl}/${esc(pr)}">PR #${esc(pr)}</a>`);
+const prText = (pr) => (pr == null ? "no PR" : `PR #${pr}`);
+const prLink = (pr) => (pr == null ? prText(pr) : `<a href="${PAGE.prUrl}/${esc(pr)}">${esc(prText(pr))}</a>`);
 const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
 const transcriptUrl = (run, kase) => {
   const base = buildUrl(run);
@@ -560,7 +561,7 @@ function agentSawHtml(inc, inWindow) {
   if (inc.condition === "setup_deaths") {
     const death = [...inWindow].reverse().find((r) => r.setup_death);
     const url = death ? buildUrl(death) : null;
-    return `<p>No agent ran. The build log is the evidence${url ? `: <a href="${esc(url)}">${prLink(death.pr).replace(/<[^>]+>/g, "")} at ${esc(et(runFinish(death)))}</a>` : ""}.</p>`;
+    return `<p>No agent ran. The build log is the evidence${url ? `: <a href="${esc(url)}">${esc(prText(death.pr))} at ${esc(et(runFinish(death)))}</a>` : ""}.</p>`;
   }
   if (!pick) return `<p class="mut">No failed repetition with a recorded reason in this window.</p>`;
   const url = transcriptUrl(pick.run, pick.c.case);
