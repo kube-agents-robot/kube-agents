@@ -11,13 +11,20 @@ red. These tests find that before Helm does, and say which key.
 Each caller's keys are resolved through the schema's `properties`. A path either
 reaches a node the schema types, or stops at one it deliberately leaves open (an
 object with no property list, or an array whose items are untyped); anything
-else is a missing entry. A real `helm` is not needed: `validate.yml` already
-lints and renders the chart under the version CI pins.
+else is a missing entry. The callers covered: `values.yaml` itself, the
+`helm_release` values block in the full-install composition, the `--set` flags
+in `hack/ci-deploy.sh`, `hack/check-image-inventory.sh`, `validate.yml` and
+`scripts/release/publish_helm_chart.sh`, and the keys `upgrade.sh` retags. Where
+a `helm` binary is present, the last class also asks Helm itself to refuse a
+misspelt key, so the README's claim has a test that goes red when the schema
+stops being enforced.
 """
 
 import json
 import pathlib
 import re
+import shutil
+import subprocess
 import unittest
 
 import yaml
@@ -29,9 +36,26 @@ _VALUES_PATH = _CHART / "values.yaml"
 _COMPOSITION_MAIN = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
 _SET_FLAG_SOURCES = (
     _REPO_ROOT / "hack" / "ci-deploy.sh",
+    _REPO_ROOT / "hack" / "check-image-inventory.sh",
     _REPO_ROOT / ".github" / "workflows" / "validate.yml",
     _REPO_ROOT / "scripts" / "release" / "publish_helm_chart.sh",
 )
+_UPGRADE_SCRIPT = _REPO_ROOT / "upgrade.sh"
+# `helm_retag "a.b.tag" "c.d.tag"` in upgrade.sh: each argument becomes a
+# `--set <key>=<tag>` the regex below cannot see, so the call sites are read instead.
+_RETAG_CALL_RE = re.compile(r'helm_retag((?:\s+"[A-Za-z][A-Za-z0-9_.]*")+)')
+_RETAG_KEY_RE = re.compile(r'"([^"]+)"')
+
+# The three values the chart requires, as validate.yml passes them.
+_REQUIRED_SET_FLAGS = (
+    "--set",
+    "platformAgent.harness.clusterName=ci-cluster",
+    "--set",
+    "platformAgent.harness.location=us-central1",
+    "--set",
+    "platformAgent.harness.projectId=ci-project",
+)
+_HELM_TIMEOUT_SECONDS = 120
 
 _DRAFT_07 = "http://json-schema.org/draft-07/schema#"
 # The marker a list index becomes in a dotted path, so `--set a[0].b` and a
@@ -47,11 +71,12 @@ _SET_INDEX_RE = re.compile(r"\[\d+\]")
 _COMMENT_LINE_RE = re.compile(r"(?m)^\s*#.*$")
 
 # HCL, as much of it as the composition's values block uses. An identifier
-# followed by `=` (not `==`, `!=`, `<=`, `>=`) is a map key; `{` opens an
-# object, `[` a list or an index, `(` a call or a ternary's parentheses.
+# followed by `=` (not `==`, `!=`, `<=`, `>=`, nor the `=>` of a `for` map
+# expression) is a map key; `{` opens an object, `[` a list or an index, `(` a
+# call or a ternary's parentheses.
 _HCL_COMPOSITION_RESOURCE = 'resource "helm_release" "kube_agents"'
 _HCL_VALUES_OPENER = "yamlencode({"
-_HCL_KEY_RE = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
+_HCL_KEY_RE = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=>])")
 _HCL_OPENERS = "{[("
 _HCL_CLOSERS = "}])"
 
@@ -277,6 +302,58 @@ class CallerKeysTest(unittest.TestCase):
                     _resolve(schema, path)
 
 
+    def test_upgrade_retag_keys_resolve(self) -> None:
+        schema = _load_schema()
+        keys = set()
+        for call in _RETAG_CALL_RE.finditer(_UPGRADE_SCRIPT.read_text()):
+            keys.update(_RETAG_KEY_RE.findall(call.group(1)))
+        self.assertIn("operator.image.tag", keys)
+        for key in sorted(keys):
+            with self.subTest(key=key):
+                _resolve(schema, tuple(key.split(".")))
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class HelmEnforcesSchemaTest(unittest.TestCase):
+    """Helm itself refuses what the schema refuses.
+
+    The shape tests above read the file; this one proves Helm loads it, which is
+    the README's claim. A `.helmignore` line or a rename that stopped the schema
+    shipping would leave every other test here green.
+    """
+
+    @staticmethod
+    def _template(*extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED_SET_FLAGS, *extra],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HELM_TIMEOUT_SECONDS,
+        )
+
+    def test_the_required_values_alone_render(self) -> None:
+        proc = self._template()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_misspelt_key_fails_with_its_path(self) -> None:
+        proc = self._template("--set", "platformAgent.harness.clustername=x")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("clustername", proc.stderr)
+        self.assertIn("/platformAgent/harness", proc.stderr)
+
+    def test_a_wrong_type_fails_with_its_path(self) -> None:
+        proc = self._template("--set", "operator.replicaCount=two")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("/operator/replicaCount", proc.stderr)
+
+    def test_a_numeric_image_tag_renders(self) -> None:
+        # Helm's --set reads an all-digit value as an integer; a date-stamped
+        # tag must not be refused on type.
+        proc = self._template("--set", "operator.image.tag=20260913")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
 class ResolverTest(unittest.TestCase):
     """The resolver itself refuses what the schema refuses, so a green run means something."""
 
@@ -289,7 +366,18 @@ class ResolverTest(unittest.TestCase):
         schema = _load_schema()
         self.assertIsNone(_resolve(schema, ("platformAgent", "annotations", "anything")))
         self.assertIsNone(_resolve(schema, ("global", "imagePullSecrets", _ITEM, "name")))
-        self.assertIsNone(_resolve(schema, ("plugins", "pubsubPlatform", "image", "tag")))
+        self.assertIsNone(_resolve(schema, ("platformAgent", "harness", "tuning", "platform", "maxTurns")))
+
+    def test_hcl_walker_skips_for_expression_arrows(self) -> None:
+        paths = _composition_value_paths(
+            'resource "helm_release" "kube_agents" {\n  values = [yamlencode({\n'
+            "    platformAgent = { integration = { slack = { for k, v in var.s : k => v } } }\n"
+            "  })]\n}\n"
+        )
+        self.assertEqual(
+            paths,
+            {("platformAgent",), ("platformAgent", "integration"), ("platformAgent", "integration", "slack")},
+        )
 
     def test_set_flag_parser_keeps_escaped_dots_in_one_segment(self) -> None:
         paths = _set_flag_paths(

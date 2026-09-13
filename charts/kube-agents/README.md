@@ -78,9 +78,11 @@ no defaults — rendering fails until they are set.
 The chart ships a `values.schema.json`, so an unknown or mistyped key — a
 `clustername` for `clusterName`, a `replicaCount` of `two` — fails `helm lint`,
 `helm template`, `helm install` and `helm upgrade` with the offending path before
-anything renders; the Terraform `helm_release` validates the same way. Blocks
-the templates pass through unread (`annotations`, `resources`, `tuning`,
-`networkPolicy`, `plugins.*`) are not checked below their key.
+anything renders; the Terraform `helm_release` validates the same way. Blocks the
+templates hand on without reading, such as `platformAgent.annotations` and the
+`resources` maps, are not checked below their key; the schema's `description`
+lists every one. An all-digit image tag is admitted as an integer, so
+`--set operator.image.tag=20260913` renders without `--set-string`.
 
 These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
 chart enables by default. On a cluster that has no such RuntimeClass the

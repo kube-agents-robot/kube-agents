@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "kube-agents chart values",
-  "description": "Every key values.yaml declares, closed at each level the templates read, so a misspelt or mistyped key fails `helm lint`, `helm template`, `helm install` and `helm upgrade` before anything renders. Objects the templates pass through unread (annotations, resources, tuning, networkPolicy, env items, credential data) carry no property list. values.yaml documents what each key does.",
+  "description": "Every key values.yaml declares, closed at each level the templates read, so a misspelt or mistyped key fails `helm lint`, `helm template`, `helm install` and `helm upgrade` before anything renders. Left open, with no property list, because the templates pass them through or hand them to something else that validates them: platformAgent.annotations, platformAgent.networkPolicy, platformAgent.credentials.data, platformAgent.harness.tuning.{default,platform,cluster}, every resources block, both serviceAccountAnnotations maps, the operator.extraEnv and platformAgent.deployment.env items, the platformAgent.security.scopedServiceAccounts items, the litellm.redaction.rules items, litellm.redaction.ip.action, and the global.imagePullSecrets items (a Secret name or {name: ...}; the chart's helper decides). values.yaml documents what each key does.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -51,7 +51,7 @@
               "type": "string"
             },
             "tag": {
-              "type": "string"
+              "type": ["string", "integer"]
             },
             "pullPolicy": {
               "type": "string"
@@ -163,7 +163,7 @@
               "type": "string"
             },
             "tag": {
-              "type": "string"
+              "type": ["string", "integer"]
             },
             "pullPolicy": {
               "type": "string"
@@ -253,7 +253,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": "string"
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -289,7 +289,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": "string"
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -372,7 +372,7 @@
               "type": "string"
             },
             "tag": {
-              "type": "string"
+              "type": ["string", "integer"]
             },
             "pullPolicy": {
               "type": "string"
@@ -412,7 +412,7 @@
               "type": "string"
             },
             "tag": {
-              "type": "string"
+              "type": ["string", "integer"]
             }
           }
         }
@@ -430,7 +430,7 @@
               "type": "string"
             },
             "tag": {
-              "type": "string"
+              "type": ["string", "integer"]
             }
           }
         }
@@ -514,7 +514,22 @@
               }
             },
             "tuning": {
-              "type": "object"
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "maxInProgress": {
+                  "type": "integer"
+                },
+                "default": {
+                  "type": "object"
+                },
+                "platform": {
+                  "type": "object"
+                },
+                "cluster": {
+                  "type": "object"
+                }
+              }
             }
           }
         },
@@ -530,7 +545,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": "string"
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -573,7 +588,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": "string"
+                  "type": ["string", "integer"]
                 }
               }
             },
@@ -737,10 +752,91 @@
       "additionalProperties": false,
       "properties": {
         "pubsubPlatform": {
-          "type": "object"
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "agentRef": {
+              "type": "string"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            }
+          }
         },
         "stockoutInvestigator": {
-          "type": "object"
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "agentRef": {
+              "type": "string"
+            },
+            "targetProfile": {
+              "type": "string"
+            },
+            "clusterName": {
+              "type": "string"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            },
+            "pubsub": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "topic": {
+                  "type": "string"
+                },
+                "subscription": {
+                  "type": "string"
+                },
+                "sink": {
+                  "type": "string"
+                },
+                "thresholdCount": {
+                  "type": "integer"
+                },
+                "thresholdWindowSeconds": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
         }
       }
     }

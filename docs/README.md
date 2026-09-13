@@ -183,7 +183,7 @@ identifier appears, add its source here.
 | Staging a sandbox-written artifact out for delivery: the per-file, per-card and total ceilings, the deadline, and the denied prefixes | `agents/platform/scripts/sandbox_artifact_patch.py` |
 | fleet-audit finding-id pattern and rendering caps | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
 | Chat-delivery watch: the `ALERT chat_delivery_watch` log prefix and file, the ledger issue's label and marker, the streak state path, and the `CHAT_DELIVERY_*` environment variables | `agents/platform/scripts/chat_delivery_watch.py` |
-| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml` |
+| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`; the accepted key set and types, `charts/kube-agents/values.schema.json` |
 | Release tag families (`rc_*`, `rc_*_validated`, `staging_<ts>_<sha>`, GA `X.Y.Z`) and the shared lookups over them | `scripts/release/common.sh` |
 | GA release gate: its conditions, exit codes, dispatch modes, and step outputs | `scripts/release/resolve_scheduled_release.sh`, `scripts/release/decide_release_gate.sh`, `.github/workflows/release-publish.yml`, and `.github/workflows/release-scheduler.yml` |
 | Stock `PlatformAgent.metadata.name` used as the admin-console installation ID | `charts/kube-agents/values.yaml` (`platformAgent.name`) |
