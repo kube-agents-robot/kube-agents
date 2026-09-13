@@ -438,7 +438,11 @@ class RenderedFilesTest(unittest.TestCase):
         self.assertNotIn("index.html?", script)
         self.assertEqual(script.count("new Intl.DateTimeFormat"), 1, "one place a time becomes text")
         self.assertNotIn("toISOString().slice(11, 16)", script, "no UTC clock text on the new pages")
-        self.assertNotIn("replace(/<[^>]+>/g", script, "text is escaped once, never rendered as markup and stripped back (CodeQL alert 30)")
+        # CodeQL alert 30: a label is escaped once, never rendered as markup and
+        # stripped back. esc is the one place a "<" is rewritten, in any spelling
+        # of the strip, and no prLink anchor is ever reduced to text.
+        self.assertEqual(len(re.findall(r"""\.replace(?:All)?\(\s*["'/]<""", script)), 1, "only esc rewrites a <")
+        self.assertNotRegex(script, r"prLink\([^)]*\)\s*\.replace", "prLink's anchor is markup, never stripped back to text")
 
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
@@ -514,9 +518,12 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("died within 5 minutes", app)
 
     def test_setup_deaths_evidence_link_is_plain_text(self):
-        # The evidence anchor's text is the PR label escaped once, not a
-        # rendered prLink with its tags stripped back off (CodeQL alert 30):
-        # no anchor nested in the anchor, and a hostile PR value stays text.
+        # The evidence anchor's text is the PR label escaped once. The form
+        # this replaced rendered prLink's anchor and stripped its tags back
+        # off (CodeQL alert 30) from text prLink had already escaped, so the
+        # DOM is the same either way; this case locks the rendered label and
+        # the once-escaped hostile text, and the source check in
+        # RenderedFilesTest is what pins the strip's absence.
         health = health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], tracking_issues=[], since=SETUP_DEATHS_SINCE)
         app = self.render_state(health, "setup-link")
         match = re.search(r'The build log is the evidence: <a href="([^"]*)">([^<]*)</a>\.', app)
