@@ -7,16 +7,23 @@ is written by hand: the chart wraps the same two webhooks in values gates and ad
 cert-manager objects, so a splice would fight the template. This script is the check that
 replaces the splice. It renders that one template with `helm template`, loads the kustomize
 source (`config/webhook/manifests.yaml` and `service.yaml`), reduces both sides to the
-fields the API server acts on, and fails with a unified diff when they differ.
+fields listed below, and fails with a unified diff when they differ.
 
-Compared, per configuration kind and webhook `name`: `clientConfig.service.path`, `rules`
-(order-insensitive), `sideEffects`, `admissionReviewVersions`, and `matchPolicy` /
-`timeoutSeconds` whenever either side sets them. Also the webhook Service's `targetPort`
-per `port`. Dropped before comparison: object and webhook metadata, annotations,
-`clientConfig.service.name` / `namespace` (release-specific), `caBundle` (injected), and
-`failurePolicy` (templated from values; .github/workflows/validate.yml covers it).
+Compared, per configuration kind and webhook `name`: every field of an
+admissionregistration.k8s.io/v1 webhook except the three dropped below, which means
+`clientConfig.service.path`, `rules` (order-insensitive, including `scope`), and each of
+WEBHOOK_FIELDS whenever either side sets it. Also the webhook Service's `targetPort` per
+`port`. Dropped before comparison: object and webhook metadata and annotations;
+`clientConfig.service.name` / `namespace` and `caBundle`, which are release-specific or
+injected; and `failurePolicy`, which the chart templates from values and defaults to
+`Ignore` on purpose while the kustomize copy says `Fail` (values.yaml explains why), so the
+two sides are meant to differ there. `.github/workflows/validate.yml` checks only the
+`Fail` fresh-install guard, not the value.
 
 A webhook present on one side only is a failure. Nothing is generated.
+
+Exit codes: 0 in sync, DRIFT_EXIT_CODE on a difference, TOOLING_EXIT_CODE when the check
+could not run (no helm, no PyYAML, a failed render). The sync script tells them apart.
 
 Run:  python3 hack/check_chart_webhooks.py      (also: make chart-check)
 """
@@ -75,26 +82,47 @@ HELM_RENDER_ARGS: tuple[str, ...] = (
     CHART_WEBHOOK_TEMPLATE,
 )
 
+# Manifest keys read on the way in.
+KIND_KEY = "kind"
+WEBHOOKS_KEY = "webhooks"
+NAME_KEY = "name"
+CLIENT_CONFIG_KEY = "clientConfig"
+CLIENT_CONFIG_SERVICE_KEY = "service"
+PATH_KEY = "path"
+RULES_KEY = "rules"
+RULE_SCOPE_KEY = "scope"
+SPEC_KEY = "spec"
+PORTS_KEY = "ports"
+PORT_KEY = "port"
+TARGET_PORT_KEY = "targetPort"
+
 WEBHOOK_KINDS: frozenset[str] = frozenset(
     {"MutatingWebhookConfiguration", "ValidatingWebhookConfiguration"}
 )
 SERVICE_KIND = "Service"
 # Key of the Service entry in the normalised structure, alongside the webhook keys.
-SERVICE_KEY = "Service"
+SERVICE_ENTRY_KEY = "Service"
 
-# Webhook fields copied verbatim when present. `admissionReviewVersions` keeps its order:
-# it is a preference list, so a reordering is a real change.
+# Webhook fields copied verbatim when present, so one set on a single side is a drift.
+# With `clientConfig` and `rules` handled separately and `failurePolicy` dropped (see the
+# module docstring), this is every remaining field of a v1 webhook. Selectors are compared
+# as whole dicts: the template's own comment says a namespaceSelector on the chart side
+# alone would let a CR outside the release namespace go unvalidated, so it must not slip
+# past. `admissionReviewVersions` and `matchConditions` keep their order: the first is a
+# preference list, the second is evaluated in order.
 WEBHOOK_FIELDS: tuple[str, ...] = (
     "sideEffects",
     "admissionReviewVersions",
     "matchPolicy",
     "timeoutSeconds",
+    "namespaceSelector",
+    "objectSelector",
+    "matchConditions",
+    "reinvocationPolicy",
 )
-# Rule fields, each a list the API server treats as a set, so each is sorted.
-RULE_FIELDS: tuple[str, ...] = ("apiGroups", "apiVersions", "operations", "resources")
-PATH_KEY = "path"
-RULES_KEY = "rules"
-SERVICE_PORTS_KEY = "ports"
+# Rule list fields, each treated as a set by the API server, so each is sorted. `scope`,
+# the rule's one scalar, is copied when present.
+RULE_LIST_FIELDS: tuple[str, ...] = ("apiGroups", "apiVersions", "operations", "resources")
 
 DIFF_FROM_LABEL = f"chart ({CHART_WEBHOOK_TEMPLATE}, rendered)"
 DIFF_TO_LABEL = "k8s-operator/config/webhook (manifests.yaml + service.yaml)"
@@ -133,13 +161,16 @@ def load_source_documents() -> list[dict[str, Any]]:
     return docs
 
 
-def _sorted_rule(rule: dict[str, Any]) -> dict[str, Any]:
-    return {field: sorted(rule.get(field) or []) for field in RULE_FIELDS}
+def _normalise_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    normalised = {field: sorted(rule.get(field) or []) for field in RULE_LIST_FIELDS}
+    if RULE_SCOPE_KEY in rule:
+        normalised[RULE_SCOPE_KEY] = rule[RULE_SCOPE_KEY]
+    return normalised
 
 
 def _normalise_webhook(webhook: dict[str, Any]) -> dict[str, Any]:
-    service = (webhook.get("clientConfig") or {}).get("service") or {}
-    rules = [_sorted_rule(rule) for rule in webhook.get(RULES_KEY) or []]
+    service = (webhook.get(CLIENT_CONFIG_KEY) or {}).get(CLIENT_CONFIG_SERVICE_KEY) or {}
+    rules = [_normalise_rule(rule) for rule in webhook.get(RULES_KEY) or []]
     normalised: dict[str, Any] = {
         PATH_KEY: service.get(PATH_KEY),
         RULES_KEY: sorted(rules, key=lambda rule: json.dumps(rule, sort_keys=True)),
@@ -152,10 +183,10 @@ def _normalise_webhook(webhook: dict[str, Any]) -> dict[str, Any]:
 
 def _normalise_service(service: dict[str, Any]) -> dict[str, Any]:
     ports = [
-        {"port": entry.get("port"), "targetPort": entry.get("targetPort")}
-        for entry in (service.get("spec") or {}).get(SERVICE_PORTS_KEY) or []
+        {PORT_KEY: entry.get(PORT_KEY), TARGET_PORT_KEY: entry.get(TARGET_PORT_KEY)}
+        for entry in (service.get(SPEC_KEY) or {}).get(PORTS_KEY) or []
     ]
-    return {SERVICE_PORTS_KEY: sorted(ports, key=lambda entry: str(entry["port"]))}
+    return {PORTS_KEY: sorted(ports, key=lambda entry: str(entry[PORT_KEY]))}
 
 
 def normalise(documents: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -166,12 +197,12 @@ def normalise(documents: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """
     normalised: dict[str, Any] = {}
     for doc in documents:
-        kind = doc.get("kind")
+        kind = doc.get(KIND_KEY)
         if kind in WEBHOOK_KINDS:
-            for webhook in doc.get("webhooks") or []:
-                normalised[f"{kind}/{webhook.get('name')}"] = _normalise_webhook(webhook)
+            for webhook in doc.get(WEBHOOKS_KEY) or []:
+                normalised[f"{kind}/{webhook.get(NAME_KEY)}"] = _normalise_webhook(webhook)
         elif kind == SERVICE_KIND:
-            normalised[SERVICE_KEY] = _normalise_service(doc)
+            normalised[SERVICE_ENTRY_KEY] = _normalise_service(doc)
     return normalised
 
 

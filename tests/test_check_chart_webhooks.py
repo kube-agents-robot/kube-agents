@@ -9,8 +9,9 @@ that differences the check promises to ignore (metadata, service name and namesp
 caBundle, failurePolicy, rule ordering) do not.
 
 The one end-to-end case renders the real chart with `helm` and skips where the binary is
-absent; the `python-tests` runner has none, and `make chart-check` in the `validate` job is
-where that render runs for real.
+absent; `make chart-check` in the `validate` job, which sets helm up, is where that render
+runs on every pull request. The sync script's exit-code plumbing is exercised with a
+`python3` shim on PATH, so it needs neither helm nor PyYAML.
 """
 
 from __future__ import annotations
@@ -19,8 +20,12 @@ import copy
 import importlib.util
 import io
 import pathlib
+import os
 import shutil
+import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
@@ -220,6 +225,57 @@ class CompareTest(unittest.TestCase):
         validating(source)["webhooks"][0]["timeoutSeconds"] = 5
         self.assertEqual(ccw.compare(chart, source), [])
 
+    def test_namespace_selector_on_the_chart_side_alone_fails(self):
+        """The drift the template's own comment warns about: scoping admission to a namespace."""
+        chart = chart_documents()
+        validating(chart)["webhooks"][0]["namespaceSelector"] = {
+            "matchLabels": {"kubernetes.io/metadata.name": "default"}
+        }
+        self.assertDrift(
+            ccw.compare(chart, source_documents()), "namespaceSelector", "kubernetes.io/metadata.name"
+        )
+
+    def test_object_selector_match_conditions_and_reinvocation_policy_are_compared(self):
+        for field, value in (
+            ("objectSelector", {"matchLabels": {"tier": "x"}}),
+            ("matchConditions", [{"name": "skip-leases", "expression": "true"}]),
+            ("reinvocationPolicy", "IfNeeded"),
+        ):
+            with self.subTest(field=field):
+                source = source_documents()
+                validating(source)["webhooks"][0][field] = value
+                self.assertDrift(ccw.compare(chart_documents(), source), field)
+
+    def test_rule_scope_on_one_side_fails_and_equal_scopes_pass(self):
+        chart = chart_documents()
+        validating(chart)["webhooks"][0]["rules"][0]["scope"] = "Namespaced"
+        self.assertDrift(ccw.compare(chart, source_documents()), '"scope"', "Namespaced")
+        source = source_documents()
+        validating(source)["webhooks"][0]["rules"][0]["scope"] = "Namespaced"
+        self.assertEqual(ccw.compare(chart, source), [])
+
+    def test_every_v1_webhook_field_is_compared_or_deliberately_dropped(self):
+        """Pins the field roster against the admissionregistration.k8s.io/v1 webhook schema."""
+        v1_webhook_fields = {
+            "admissionReviewVersions",
+            "clientConfig",
+            "failurePolicy",
+            "matchConditions",
+            "matchPolicy",
+            "name",
+            "namespaceSelector",
+            "objectSelector",
+            "reinvocationPolicy",
+            "rules",
+            "sideEffects",
+            "timeoutSeconds",
+        }
+        handled_elsewhere = {"clientConfig", "rules", "name"}
+        deliberately_dropped = {"failurePolicy"}
+        self.assertEqual(
+            set(ccw.WEBHOOK_FIELDS), v1_webhook_fields - handled_elsewhere - deliberately_dropped
+        )
+
 
 class WiringTest(unittest.TestCase):
     """The check only runs if the sync script and the template still point at it."""
@@ -248,6 +304,50 @@ class WiringTest(unittest.TestCase):
             ],
         )
         self.assertEqual(normalised["Service"]["ports"], [{"port": 443, "targetPort": 10250}])
+
+
+class SyncScriptExitCodeTest(unittest.TestCase):
+    """`sync-chart-manifests.sh --check` runs the check and tells drift from tooling failure.
+
+    A `python3` shim on PATH stands in for the check, so this covers the bash branch (which
+    exit code gets the hand-edit hint, which is passed through) without helm or PyYAML. The
+    CRD, RBAC and admission-policy steps before it run for real against the checkout.
+    """
+
+    SHIM_STDERR = "shim: check output"
+
+    def run_check_with_shim(self, exit_code):
+        with tempfile.TemporaryDirectory() as shim_dir:
+            shim = pathlib.Path(shim_dir) / "python3"
+            shim.write_text(
+                "#!/bin/sh\n"
+                f'[ "$(basename "$1")" = "check_chart_webhooks.py" ] || {{ echo "unexpected: $*" >&2; exit 99; }}\n'
+                f"echo '{self.SHIM_STDERR}' >&2\n"
+                f"exit {exit_code}\n"
+            )
+            shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+            env = dict(os.environ, PATH=f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+            return subprocess.run(
+                [str(SYNC_SCRIPT), "--check"], capture_output=True, text=True, env=env, check=False
+            )
+
+    def test_check_mode_passes_when_the_check_passes(self):
+        proc = self.run_check_with_shim(0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("webhook template matches", proc.stdout)
+
+    def test_drift_exits_one_with_the_hand_edit_hint(self):
+        proc = self.run_check_with_shim(1)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(self.SHIM_STDERR, proc.stderr)
+        self.assertIn("has drifted", proc.stderr)
+        self.assertIn("hand-maintained", proc.stderr)
+
+    def test_tooling_failure_is_passed_through_without_the_hint(self):
+        proc = self.run_check_with_shim(2)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(self.SHIM_STDERR, proc.stderr)
+        self.assertNotIn("has drifted", proc.stderr)
 
 
 class EndToEndTest(unittest.TestCase):
