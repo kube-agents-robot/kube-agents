@@ -528,7 +528,7 @@ class BrowserTest(unittest.TestCase):
         app = self.render_state(health, "setup-link")
         match = re.search(r'The build log is the evidence: <a href="([^"]*)">([^<]*)</a>\.', app)
         self.assertTrue(match, app)
-        self.assertIn(f"/1274/{SETUP_DEATH_BUILD}", match.group(1))
+        self.assertTrue(match.group(1).endswith(f"/gke-labs_kube-agents/1274/pull-kube-agents-smoke-test/{SETUP_DEATH_BUILD}"), match.group(1))
         self.assertEqual(match.group(2), SETUP_DEATH_LABEL)
         hostile = json.loads(json.dumps(self.data))
         next(r for r in hostile["runs"] if r["build_id"] == SETUP_DEATH_BUILD)["pr"] = HOSTILE_PR
