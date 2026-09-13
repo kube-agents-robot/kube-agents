@@ -75,6 +75,13 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 `platformAgent.harness.{clusterName,location,projectId}` are required and have
 no defaults — rendering fails until they are set.
 
+The chart ships a `values.schema.json`, so an unknown or mistyped key — a
+`clustername` for `clusterName`, a `replicaCount` of `two` — fails `helm lint`,
+`helm template`, `helm install` and `helm upgrade` with the offending path before
+anything renders; the Terraform `helm_release` validates the same way. Blocks
+the templates pass through unread (`annotations`, `resources`, `tuning`,
+`networkPolicy`, `plugins.*`) are not checked below their key.
+
 These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
 chart enables by default. On a cluster that has no such RuntimeClass the
 operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
