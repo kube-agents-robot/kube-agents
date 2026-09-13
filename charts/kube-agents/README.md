@@ -658,6 +658,9 @@ helm uninstall kube-agents -n kubeagents-system
   two published releases.
 - The CRD, RBAC and admission-policy manifests under this chart are generated
   copies of `k8s-operator/config/` — edit the source and run `make chart-sync`
-  (CI enforces this via `make chart-check`).
+  (CI enforces this via `make chart-check`). `make chart-check` also renders
+  `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
+  its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
+  (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.

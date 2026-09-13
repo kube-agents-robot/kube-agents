@@ -14,6 +14,10 @@
   Mirrors k8s-operator/config/webhook and config/certmanager, which the
   kustomize install path composes in k8s-operator/config/default. The kustomize
   copy is the source of truth; keep this template in step with it.
+  hack/check_chart_webhooks.py (run by `make chart-check`, so CI) renders this
+  template and fails on any difference in a webhook's path, rules, sideEffects,
+  admissionReviewVersions, matchPolicy or timeoutSeconds, or in the Service's
+  targetPort. failurePolicy is templated from values and is not compared.
 */}}
 apiVersion: v1
 kind: Service
