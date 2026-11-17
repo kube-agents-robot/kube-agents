@@ -554,14 +554,16 @@ class ForgeScriptTest(unittest.TestCase):
         marker = self.dir / "relay-gone"
         self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker)).returncode, 0)
         recreated = []
+        waited = []
         for _ in range(100):  # the keeper's restart pause is 2 s
             recreated = self.calls_of("kubectl --context host-ctx run forge-relay ")
-            if recreated:
+            waited = self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay")
+            if recreated and waited:
                 break
             time.sleep(0.1)
         self.assertTrue(recreated, "a relay the drain took is re-created, in the recorded context")
         self.assertIn("TCP-LISTEN:8443,fork,reuseaddr", recreated[0])
-        self.assertTrue(self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
+        self.assertTrue(waited)
         self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
 
     def test_down_on_ghes_deletes_a_relay_pod_a_dead_gitlab_ce_run_left(self):
