@@ -25,6 +25,15 @@ HACK = REPO_ROOT / "hack"
 PROJECT = "kube-agents-evals-2"
 FORGE_IP = "10.128.0.251"
 
+# The background tunnel keeper runs asynchronously alongside `up` (its 2 s
+# restart pause is real wall clock, and STUB_CURL returns 200 without waiting
+# for port-forward), so keeper assertions poll STUB_CALLS up to a monotonic
+# deadline; STUB_KUBECTL holds `run forge-relay` for two poll intervals after
+# logging it so an unpolled `wait` assertion fails deterministically.
+KEEPER_CALL_TIMEOUT_SECONDS = 10
+KEEPER_CALL_POLL_SECONDS = 0.1
+STUB_RELAY_RUN_DELAY_SECONDS = 0.2
+
 # gcloud: records argv; answers the reads `up` makes from a per-test state
 # directory (what exists is a file in GCLOUD_STATE), and the serial console from
 # a file the test writes.
@@ -96,6 +105,9 @@ STUB_KUBECTL = textwrap.dedent(
       "--context "*" get pod "*)
         if [ -n "${STUB_RELAY_GONE:-}" ] && [ ! -e "${STUB_RELAY_GONE}.get" ]; then : > "${STUB_RELAY_GONE}.get"; echo 'Error from server (NotFound): pods "forge-relay" not found'; exit 1; fi
         echo Running; exit 0 ;;
+"""
+    f'      "--context "*" run forge-relay "*) sleep {STUB_RELAY_RUN_DELAY_SECONDS}; exit 0 ;;\n'
+    """\
       "port-forward "*) exec sleep 600 ;;
       "wait "*|"delete pod "*|"--context "*|"run forge-relay "*) exit 0 ;;
       "config current-context") echo host-ctx; exit 0 ;;
@@ -223,6 +235,14 @@ class ForgeScriptTest(unittest.TestCase):
     def calls_of(self, verb: str):
         text = self.calls.read_text() if self.calls.exists() else ""
         return [line for line in text.splitlines() if verb in line]
+
+    def wait_for_calls(self, verb: str):
+        deadline = time.monotonic() + KEEPER_CALL_TIMEOUT_SECONDS
+        while True:
+            matched = self.calls_of(verb)
+            if matched or time.monotonic() >= deadline:
+                return matched
+            time.sleep(KEEPER_CALL_POLL_SECONDS)
 
     # ── the public rows ───────────────────────────────────────────────────────
 
@@ -462,7 +482,7 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn("--image=alpine/socat:1.8.1.3@sha256:", relay)
         self.assertIn(f"TCP-LISTEN:8443,fork,reuseaddr TCP:{FORGE_IP}:443", relay)
         self.assertTrue(self.calls_of("kubectl wait --for=condition=Ready pod/forge-relay"))
-        self.assertTrue(self.calls_of("kubectl --context host-ctx port-forward -n default pod/forge-relay --address 127.0.0.1 443:8443"), "the keeper restarts in the context up recorded")
+        self.assertTrue(self.wait_for_calls("kubectl --context host-ctx port-forward -n default pod/forge-relay --address 127.0.0.1 443:8443"), "the keeper restarts in the context up recorded")
         pid = int((self.state_dir / "forge-tunnel-pid").read_text().strip())
         os.kill(pid, 0)  # the keeper is alive after up returns: the deploy and the eval use its port-forward
         self.assertEqual((self.state_dir / "forge-tunnel-context").read_text().strip(), "host-ctx", "the context the relay lives in, for down")
@@ -553,15 +573,10 @@ class ForgeScriptTest(unittest.TestCase):
         self.provision()
         marker = self.dir / "relay-gone"
         self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker)).returncode, 0)
-        recreated = []
-        for _ in range(100):  # the keeper's restart pause is 2 s
-            recreated = self.calls_of("kubectl --context host-ctx run forge-relay ")
-            if recreated:
-                break
-            time.sleep(0.1)
+        recreated = self.wait_for_calls("kubectl --context host-ctx run forge-relay ")
         self.assertTrue(recreated, "a relay the drain took is re-created, in the recorded context")
         self.assertIn("TCP-LISTEN:8443,fork,reuseaddr", recreated[0])
-        self.assertTrue(self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
+        self.assertTrue(self.wait_for_calls("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
         self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
 
     def test_down_on_ghes_deletes_a_relay_pod_a_dead_gitlab_ce_run_left(self):
