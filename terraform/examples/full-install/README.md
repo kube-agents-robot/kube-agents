@@ -275,8 +275,10 @@ plan instead, and the variable's description says what the policy does and does
 not deny today. `agent_ksa_name` has no `install.env` key of its own yet, so
 through the front doors it is a `TF_VAR_agent_ksa_name=...` line in that file:
 every front door sources it with `set -a`, and the generator never writes
-`agent_ksa_name` into `terraform.tfvars`, so the passthrough is what Terraform
-reads. The caution above applies to it with one gap — a lost line resolves the
+`agent_ksa_name` into `terraform.tfvars`, so on `install.sh`, its Day-2 menu
+and `upgrade.sh` the passthrough is what Terraform reads (`uninstall.sh` unsets
+`TF_VAR_agent_ksa_name` before destroy so a malformed or empty line cannot stop
+teardown). The caution above applies to it with one gap — a lost line resolves the
 KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
@@ -1045,9 +1047,10 @@ about it writes both into the generated `terraform.tfvars`, which is the only
 order the precondition accepts. `ENABLE_DRIFT_DETECTOR=false` writes neither —
 the one boolean in that generated file omitted rather than written `false`. `enable_drift_pubsub` is
 reachable on its own as a `TF_VAR_enable_drift_pubsub=true` line in
-`install.env`, the same channel `agent_ksa_name` uses (every front door sources
-that file with `set -a`, and Terraform reads `TF_VAR_*` where the generated file
-is silent), and a tfvars key beats `TF_VAR_`: a written `false` would override
+`install.env`, the same channel `agent_ksa_name` uses on `install.sh` and
+`upgrade.sh` (every front door sources that file with `set -a`, and Terraform
+reads `TF_VAR_*` where the generated file is silent; `uninstall.sh` unsets
+`TF_VAR_agent_ksa_name` before destroy), and a tfvars key beats `TF_VAR_`: a written `false` would override
 such an install and plan its sinks, topic and subscription — with up to 31 days
 of retained audit records nothing has acknowledged — for removal under
 `-auto-approve`, from a release note nobody read. Omission is what leaves it

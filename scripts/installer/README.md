@@ -120,7 +120,9 @@ between them is the whole model.
 parameter block, `upgrade.sh` and `uninstall.sh` through `load_install_env`, the Day-2
 menu, and `common.sh`'s `load_state` for the dev scripts — with `set -a` so the values
 reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read the
-environment. Order of authority is **flag, then file, then an exported variable, then
+environment (`uninstall.sh` then blanks validated `install.env` inputs and unsets
+`TF_VAR_agent_ksa_name` before regenerating `terraform.tfvars` and running `destroy`, so a
+malformed value cannot stop teardown). Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run. The chat
 flags and `--mode` are the exception: on an existing file they are held to it, as described below.
