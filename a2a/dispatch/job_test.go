@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -155,31 +157,43 @@ func TestAJobThatNeverStartsFailsItsTask(t *testing.T) {
 // a redelivery to adopt, and a crash between the two must not run a task
 // already reported failed.
 func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
-	b := newBus(t)
+	noLeases := []*natsserver.User{{Username: "disp-nokv", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"$KV." + lib.ProfileLeaseBucket + ".>"}}}}}
+	b := newBusWith(t, noLeases)
 	b.ensure("inv", 1, 0, "unattended")
 	key := lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")
 	var (
-		once       sync.Once
 		seen       atomic.Bool
 		tombstoned atomic.Bool
 		lookupErr  error
 	)
 	b.onTerminal = func(taskID string) {
-		if taskID != "task-1" {
+		if taskID != "task-1" || seen.Load() {
 			return
 		}
-		once.Do(func() {
-			ok, err := b.hasTombstone(key)
-			lookupErr = err
-			tombstoned.Store(ok)
-			seen.Store(true)
-		})
+		ok, err := b.hasTombstone(key)
+		lookupErr = err
+		tombstoned.Store(ok)
+		seen.Store(true)
 	}
-	jobs := newFakeJobs(-1)
-	jobs.failed["task-1"] = true
-	b.runDispatcherWith(testConfig(), unattendedInstall(1, nil), &fakeVerifier{}, jobs)
+	ti := unattendedInstall(1, nil)
+	jobs1 := newFakeJobs(-1)
+	jobs1.failed["task-1"] = true
+	var g grantSwitch
+	g.set("disp-nokv")
+	_, stop1 := b.runPrepared(b.connectAs(&g), testConfig(), ti, &fakeVerifier{}, func(d *Dispatcher) { d.UseJobs(jobs1) })
 
 	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the failed Job deleted before entomb", func() bool { return jobs1.deleted("task-1") })
+	time.Sleep(time.Second)
+	stop1()
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Fatalf("failed no-worker terminal published before its tombstone could be written: %+v", ts)
+	}
+
+	jobs2 := newFakeJobs(-1)
+	jobs2.failed["task-1"] = true
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs2)
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateFailed || !hasReason(ts, ReasonNoWorker) {
 		t.Fatalf("terminal %+v, want failed no-worker", ts)
 	}
