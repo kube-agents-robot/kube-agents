@@ -24,6 +24,17 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _REPO = "gke-agentic/kube-agents-evals-2-infra"
 
+# The stubbed renewer sleeps _RENEW_SLEEP_SECONDS per tick (overridable via
+# RENEW_SLEEP) so renewal is observable in fractions of a second rather than
+# forty minutes; _FAST_RENEW_SLEEP_SECONDS drives multiple renewals ahead of the
+# read. Together _RENEWAL_POLLS and _RENEWAL_POLL_SECONDS give 10s of poll slack
+# inside the subprocess's 60s timeout.
+_RENEW_SLEEP_SECONDS = 0.2
+_FAST_RENEW_SLEEP_SECONDS = 0.05
+_RENEWAL_POLLS = 50
+_RENEWAL_POLL_SECONDS = 0.2
+_RENEWED_TOKEN_RE = re.compile(r"^RENEWED=tok-write-(?:[2-9]|[1-9][0-9]+)$", re.M)
+
 
 def _extract(pattern, what):
     text = _CI_EVAL_PR.read_text(encoding="utf-8")
@@ -77,7 +88,25 @@ class _Harness(unittest.TestCase):
                 "LEDGER_TOKEN_RENEW_SECONDS=1",
                 "LEDGER_TOKEN_RENEW_TICK_SECONDS=1",
                 "LEDGER_TOKEN_RENEW_RETRY_SECONDS=1",
-                "sleep() { command sleep 0.2; }",
+                f"RENEWAL_POLLS={_RENEWAL_POLLS}",
+                f"RENEWAL_POLL_SECONDS={_RENEWAL_POLL_SECONDS}",
+                'sleep() { command sleep "${RENEW_SLEEP}"; }',
+                # Reads the token file once per poll into a local variable so a
+                # concurrent swap between the check and a second read cannot
+                # change what is reported; prints the last read on timeout so
+                # the test assertion sees what was in the file.
+                "wait_for_renewed_token() {",
+                '  local file="$1" initial="$2" current=""',
+                '  for _ in $(seq 1 "${RENEWAL_POLLS}"); do',
+                '    current="$(cat "${file}" 2>/dev/null || true)"',
+                '    if [ -n "${current}" ] && [ "${current}" != "${initial}" ]; then',
+                '      printf "%s\\n" "${current}"',
+                "      return 0",
+                "    fi",
+                '    command sleep "${RENEWAL_POLL_SECONDS}"',
+                "  done",
+                '  printf "%s\\n" "${current}"',
+                "}",
                 # Records each body it is asked for; answers by MINT, and
                 # numbers the tokens so a renewal shows as a new one.
                 'echo 0 > "${COUNT_FILE}"',
@@ -103,6 +132,7 @@ class _Harness(unittest.TestCase):
             "TOKEN_FILE": str(self.tmp / "unit.gitops-token"),
             "COUNT_FILE": str(self.tmp / "mint-count"),
             "BODY_FILE": str(self.tmp / "mint-bodies"),
+            "RENEW_SLEEP": str(_RENEW_SLEEP_SECONDS),
         }
         overrides.update(env)
         return subprocess.run(
@@ -129,8 +159,8 @@ class GitopsWriteTokenTest(_Harness):
             echo "EXPORTED=${TF_VAR_bench_gitops_write_token_file}"
             echo "AT_LAUNCH=$(cat "${TOKEN_FILE}")"
             echo "MODE=$(stat -c %a "${TOKEN_FILE}" 2>/dev/null || stat -f %Lp "${TOKEN_FILE}")"
-            for _ in $(seq 1 50); do grep -q tok-write-2 "${TOKEN_FILE}" && break; command sleep 0.2; done
-            echo "RENEWED=$(cat "${TOKEN_FILE}")"
+            RENEWED=$(wait_for_renewed_token "${TOKEN_FILE}" "tok-write-1")
+            echo "RENEWED=${RENEWED}"
             renewer="${GITOPS_WRITE_TOKEN_RENEWER}"
             stop_gitops_write_token "${TOKEN_FILE}"
             kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
@@ -144,7 +174,7 @@ class GitopsWriteTokenTest(_Harness):
         self.assertIn(f"EXPORTED={self.tmp / 'unit.gitops-token'}", out)
         self.assertIn("AT_LAUNCH=tok-write-1", out)
         self.assertIn("MODE=600", out)
-        self.assertIn("RENEWED=tok-write-2", out)
+        self.assertRegex(out, _RENEWED_TOKEN_RE)
         self.assertIn("RENEWER=gone", out)
         self.assertIn("FILE=removed", out)
         self.assertIn("UNSET=\n", out + "\n")
@@ -153,6 +183,34 @@ class GitopsWriteTokenTest(_Harness):
         body = self._bodies()[0]
         self.assertEqual(body["repositories"], ["kube-agents-evals-2-infra"])
         self.assertEqual(body["permissions"], {"pull_requests": "write", "contents": "write", "issues": "write"})
+
+    def test_a_later_renewal_before_the_read_still_counts_as_renewed(self):
+        proc = self._run(
+            """\
+            printf 'tok-write-1\\n' > "${TOKEN_FILE}.static"
+            STALE=$(RENEWAL_POLLS=1 RENEWAL_POLL_SECONDS=0 wait_for_renewed_token "${TOKEN_FILE}.static" "tok-write-1")
+            echo "STALE=${STALE}"
+            start_gitops_write_token "case rep 1" "${TOKEN_FILE}"
+            for _ in $(seq 1 "${RENEWAL_POLLS}"); do
+              case "$(cat "${TOKEN_FILE}" 2>/dev/null || true)" in
+                ""|tok-write-1|tok-write-2) command sleep "${RENEWAL_POLL_SECONDS}" ;;
+                *) break ;;
+              esac
+            done
+            RENEWED=$(wait_for_renewed_token "${TOKEN_FILE}" "tok-write-1")
+            echo "RENEWED=${RENEWED}"
+            stop_gitops_write_token "${TOKEN_FILE}"
+            """,
+            RENEW_SLEEP=str(_FAST_RENEW_SLEEP_SECONDS),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("STALE=tok-write-1\n", proc.stdout)
+        self.assertNotIn("RENEWED=tok-write-2\n", proc.stdout)
+        self.assertRegex(proc.stdout, _RENEWED_TOKEN_RE)
+        self.assertNotRegex("RENEWED=tok-write-0", _RENEWED_TOKEN_RE)
+        self.assertNotRegex("RENEWED=tok-write-1", _RENEWED_TOKEN_RE)
+        self.assertRegex("RENEWED=tok-write-2", _RENEWED_TOKEN_RE)
+        self.assertRegex("RENEWED=tok-write-10", _RENEWED_TOKEN_RE)
 
     def test_a_refused_mint_writes_nothing_and_says_so(self):
         proc = self._run(
