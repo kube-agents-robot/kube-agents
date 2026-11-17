@@ -159,13 +159,12 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	b.ensure("inv", 1, 0, "unattended")
 	key := lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")
 	var once sync.Once
-	var seen, tombstoned atomic.Bool
+	var tombstoned atomic.Bool
 	b.onTerminal = func(taskID string) {
 		if taskID == "task-1" {
 			once.Do(func() {
 				_, ok := b.tombstones()[key]
 				tombstoned.Store(ok)
-				seen.Store(true)
 			})
 		}
 	}
@@ -177,7 +176,6 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateFailed || !hasReason(ts, ReasonNoWorker) {
 		t.Fatalf("terminal %+v, want failed no-worker", ts)
 	}
-	waitFor(t, 5*time.Second, "the terminal hook", seen.Load)
 	if !tombstoned.Load() {
 		t.Error("the failed no-worker terminal went out before the tombstone")
 	}
