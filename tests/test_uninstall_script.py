@@ -1152,6 +1152,12 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         minter_ksa_at = text.find('export GITHUB_MINTER_KSA_NAME=""')
         self.assertNotEqual(minter_ksa_at, -1, "uninstall.sh must blank GITHUB_MINTER_KSA_NAME")
         self.assertLess(minter_ksa_at, call_at)
+        # The agent's KSA name: it travels via TF_VAR_agent_ksa_name (omitted
+        # from terraform.tfvars), and terraform validates it as a DNS-1123 label
+        # ending in -agent; an empty export would fail both validations.
+        agent_ksa = re.search(r"^\s*unset TF_VAR_agent_ksa_name\s*$", text, re.MULTILINE)
+        self.assertIsNotNone(agent_ksa, "uninstall.sh must unset TF_VAR_agent_ksa_name")
+        self.assertLess(agent_ksa.start(), call_at)
         provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
         self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
         self.assertLess(provider_at, call_at)
@@ -1213,6 +1219,108 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         alert_at = text.find(alert_export)
         self.assertNotEqual(alert_at, -1, f"uninstall.sh must blank every ALERT_DAILY_LIMIT_* key: {alert_export}")
         self.assertLess(alert_at, call_at)
+
+
+class MalformedAgentKsaNameCannotBlockTeardownTest(unittest.TestCase):
+    """`agent_ksa_name` travels via `TF_VAR_agent_ksa_name` rather than
+    `terraform.tfvars`, and an empty `TF_VAR_` overrides Terraform's default
+    with `""` and fails both validations. `uninstall.sh` must unset it before
+    regenerating `terraform.tfvars` and invoking `lifecycle.sh destroy`.
+    """
+
+    def _run_teardown(self, tmp, install_env_text=None, shell_agent_ksa=None, args=()):
+        bin_dir = create_minimal_tools_bin(tmp)
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"storage cat"*) echo "{}"; exit 0 ;;\n'
+            '  *"clusters describe"*) echo "NOT_FOUND" >&2; exit 1 ;;\n'
+            "esac\n"
+            "exit 0\n"
+        )
+        gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+        terraform = bin_dir / "terraform"
+        terraform.write_text("#!/usr/bin/env bash\nexit 0\n")
+        terraform.chmod(terraform.stat().st_mode | stat.S_IEXEC)
+
+        root = _scratch_repo(tmp)
+        if install_env_text is not None:
+            (root / "install.env").write_text(install_env_text)
+        compose_dir = root / "terraform" / "examples" / "full-install"
+        lifecycle_log = pathlib.Path(tmp) / "lifecycle.log"
+        lifecycle = compose_dir / "lifecycle.sh"
+        lifecycle.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "ARGS=%s\\n" "$*" > "$LIFECYCLE_LOG"\n'
+            'if [ "${TF_VAR_agent_ksa_name+present}" = "present" ]; then\n'
+            '  printf "AGENT_KSA_ENV=set:%s\\n" "$TF_VAR_agent_ksa_name" >> "$LIFECYCLE_LOG"\n'
+            "else\n"
+            '  printf "AGENT_KSA_ENV=unset\\n" >> "$LIFECYCLE_LOG"\n'
+            "fi\n"
+        )
+        lifecycle.chmod(lifecycle.stat().st_mode | stat.S_IEXEC)
+
+        overrides = {
+            "PATH": str(bin_dir),
+            "HOME": str(pathlib.Path(tmp) / "empty-home"),
+            "KUBE_AGENTS_INSTALL_ENV": "",
+            "KUBE_AGENTS_STATE_BUCKET": "",
+            "LIFECYCLE_LOG": str(lifecycle_log),
+        }
+        if shell_agent_ksa is not None:
+            overrides["TF_VAR_agent_ksa_name"] = shell_agent_ksa
+
+        proc = subprocess.run(
+            ["bash", str(root / "uninstall.sh"), "--non-interactive", *args],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides=overrides,
+                absent=("TF_VAR_agent_ksa_name",),
+            ),
+            cwd=str(tmp),
+        )
+        log = lifecycle_log.read_text() if lifecycle_log.exists() else ""
+        tfvars = (compose_dir / "terraform.tfvars").read_text() if (compose_dir / "terraform.tfvars").exists() else ""
+        return proc, log, tfvars, root
+
+    def test_malformed_or_empty_agent_ksa_name_reaches_destroy_unset(self):
+        cases = (
+            (
+                "malformed_in_install_env_and_shell",
+                'PROJECT_ID="p1"\nCLUSTER_NAME="c1"\nREGION="us-central1"\nTF_VAR_agent_ksa_name="Not_A_DNS_Label"\n',
+                "missing-suffix",
+                (),
+            ),
+            (
+                "empty_in_install_env",
+                'PROJECT_ID="p1"\nCLUSTER_NAME="c1"\nREGION="us-central1"\nTF_VAR_agent_ksa_name=""\n',
+                None,
+                (),
+            ),
+            (
+                "malformed_in_shell_without_install_env",
+                None,
+                "Not_A_DNS_Label",
+                ("--gcp-project-id=p1", "--gke-cluster-name=c1", "--gcp-region=us-central1"),
+            ),
+        )
+        for label, install_env_text, shell_agent_ksa, extra_args in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                proc, log, tfvars, root = self._run_teardown(
+                    tmp,
+                    install_env_text=install_env_text,
+                    shell_agent_ksa=shell_agent_ksa,
+                    args=extra_args,
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, combined)
+                self.assertIn("ARGS=destroy -auto-approve -input=false\n", log)
+                self.assertIn("AGENT_KSA_ENV=unset\n", log)
+                self.assertNotIn("agent_ksa_name", tfvars)
+                if install_env_text is not None:
+                    self.assertEqual((root / "install.env").read_text(), install_env_text)
 
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):
