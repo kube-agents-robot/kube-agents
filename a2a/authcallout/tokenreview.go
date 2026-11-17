@@ -66,9 +66,11 @@ type TokenValidator struct {
 	audience string
 
 	// now is injectable for tests. cacheTTL is reviewCacheTTL, or zero in
-	// a test that has to see every review.
-	now      func() time.Time
-	cacheTTL time.Duration
+	// a test that has to see every review. beforeFlight, when set, runs
+	// after an outer cache miss and before singleflight in tests.
+	now          func() time.Time
+	cacheTTL     time.Duration
+	beforeFlight func()
 
 	// group collapses concurrent reviews of one token into one call.
 	group singleflight.Group
@@ -85,6 +87,13 @@ type TokenValidator struct {
 type cachedReview struct {
 	att     Attested
 	expires time.Time
+}
+
+// reviewedResult carries both the attestation and whether singleflight got it
+// from memory or from a new TokenReview.
+type reviewedResult struct {
+	att    Attested
+	source reviewSource
 }
 
 // NewTokenValidator builds a validator bound to one audience.
@@ -160,6 +169,9 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	if att, ok := v.remembered(key); ok {
 		return att, reviewCached, nil
 	}
+	if v.beforeFlight != nil {
+		v.beforeFlight()
+	}
 
 	// One review per token however many connections present it at once:
 	// the others wait for the first's answer. DoChan rather than Do so a
@@ -171,6 +183,12 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	// The review gets the decision budget of its own from the moment it
 	// starts.
 	results := v.group.DoChan(string(key[:]), func() (any, error) {
+		// Re-check inside the flight: a caller that missed remembered
+		// while an earlier flight was finishing enters DoChan after that
+		// flight has cached its answer and left the group.
+		if att, ok := v.remembered(key); ok {
+			return reviewedResult{att: att, source: reviewCached}, nil
+		}
 		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authDecisionBudget)
 		defer cancel()
 		att, err := v.review(reviewCtx, token)
@@ -178,14 +196,15 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 			return nil, err
 		}
 		v.remember(key, att)
-		return att, nil
+		return reviewedResult{att: att, source: reviewFresh}, nil
 	})
 	select {
 	case r := <-results:
 		if r.Err != nil {
 			return Attested{}, "", r.Err
 		}
-		return r.Val.(Attested), reviewFresh, nil
+		got := r.Val.(reviewedResult)
+		return got.att, got.source, nil
 	case <-ctx.Done():
 		return Attested{}, "", fmt.Errorf("TokenReview call failed: %w", ctx.Err())
 	}

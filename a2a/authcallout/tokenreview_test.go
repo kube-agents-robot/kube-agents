@@ -410,32 +410,104 @@ func TestConcurrentPresentationsOfOneTokenShareOneReview(t *testing.T) {
 	var arrived sync.WaitGroup
 	arrived.Add(presentations)
 	c, reviews := countingReviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
-		// Hold the one review until every presentation has been made, so
-		// the collapse is the subject rather than the memory of a review
-		// that finished first.
+		// Hold the one review until every presentation has missed the
+		// outer cache check, so none is answered by that check before
+		// reaching singleflight.
 		arrived.Wait()
 		return authenticated(gatewaySA, testAudience)(req)
 	})
-	v, _ := NewTokenValidator(c, testAudience)
+	v, err := NewTokenValidator(c, testAudience)
+	if err != nil {
+		t.Fatalf("NewTokenValidator: %v", err)
+	}
+	clock := time.Date(2026, time.November, 2, 1, 0, 0, 0, time.UTC)
+	v.now = func() time.Time { return clock }
+	v.beforeFlight = arrived.Done
 
 	results := make(chan error, presentations)
 	for i := 0; i < presentations; i++ {
 		go func() {
-			arrived.Done()
-			att, err := v.Validate(context.Background(), "a-token")
-			if err == nil && att.ServiceAccount != gatewaySA {
-				err = errors.New("a shared review answered with " + att.ServiceAccount)
+			att, callErr := v.Validate(context.Background(), "a-token")
+			if callErr == nil && att.ServiceAccount != gatewaySA {
+				callErr = errors.New("a shared review answered with " + att.ServiceAccount)
 			}
-			results <- err
+			results <- callErr
 		}()
 	}
 	for i := 0; i < presentations; i++ {
-		if err := <-results; err != nil {
-			t.Fatalf("a presentation failed: %v", err)
+		if callErr := <-results; callErr != nil {
+			t.Fatalf("a presentation failed: %v", callErr)
 		}
 	}
 	if got := reviews.Load(); got != 1 {
 		t.Errorf("TokenReviews = %d for %d concurrent presentations of one token; want 1", got, presentations)
+	}
+}
+
+// A presentation that misses the outer cache check while another's review is
+// finishing reaches DoChan after that flight has cached its answer and left
+// singleflight; re-checking the cache inside DoChan serves it from memory
+// instead of starting a second TokenReview.
+func TestAPresentationMissingTheCacheBeforeAReviewFinishesUsesItsMemory(t *testing.T) {
+	var startedOnce sync.Once
+	reviewStarted := make(chan struct{})
+	secondAtGate := make(chan struct{})
+	firstFinished := make(chan struct{})
+
+	c, reviews := countingReviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		startedOnce.Do(func() { close(reviewStarted) })
+		<-secondAtGate
+		return boundToPod(gatewaySA, "chat-otter-1a2b", "uid-1234", testAudience)(req)
+	})
+	v, err := NewTokenValidator(c, testAudience)
+	if err != nil {
+		t.Fatalf("NewTokenValidator: %v", err)
+	}
+	clock := time.Date(2026, time.November, 2, 1, 0, 0, 0, time.UTC)
+	v.now = func() time.Time { return clock }
+
+	var flightCalls atomic.Int64
+	v.beforeFlight = func() {
+		if flightCalls.Add(1) == 2 {
+			close(secondAtGate)
+			<-firstFinished
+		}
+	}
+
+	type outcome struct {
+		att    Attested
+		source reviewSource
+		err    error
+	}
+	firstDone := make(chan outcome, 1)
+	go func() {
+		defer close(firstFinished)
+		att, source, firstErr := v.validate(context.Background(), "a-token")
+		firstDone <- outcome{att: att, source: source, err: firstErr}
+	}()
+
+	select {
+	case <-reviewStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first presentation never started a TokenReview")
+	}
+
+	second, secondSource, secondErr := v.validate(context.Background(), "a-token")
+	if secondErr != nil {
+		t.Fatalf("second presentation: %v", secondErr)
+	}
+	first := <-firstDone
+	if first.err != nil || first.source != reviewFresh {
+		t.Fatalf("first presentation = %+v, %q, %v; want a fresh review", first.att, first.source, first.err)
+	}
+	if secondSource != reviewCached {
+		t.Errorf("second presentation source = %q; want %q", secondSource, reviewCached)
+	}
+	if second != first.att {
+		t.Errorf("second presentation = %+v; want %+v", second, first.att)
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d; want 1", got)
 	}
 }
 
