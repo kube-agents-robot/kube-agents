@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,9 +29,11 @@ import (
 // so every test is also a test that the dispatcher is its only writer.
 
 const (
-	adminUser = "admin"
-	adminPass = "admin-pw"
-	workerPW  = "worker-pw"
+	adminUser        = "admin"
+	adminPass        = "admin-pw"
+	workerPW         = "worker-pw"
+	terminalHookWait = 5 * time.Second
+	terminalHookHold = 50 * time.Millisecond
 )
 
 // testConfig is the dispatcher's process settings at test speed.
@@ -109,8 +112,13 @@ type bus struct {
 
 	mu        sync.Mutex
 	terminals map[string][]terminalSeen
-	// onTerminal, if set before the dispatcher runs, is called with each
-	// terminal's task as it arrives.
+	// onTerminal, if set before the dispatcher runs or any terminal is
+	// published, runs on the NATS subscription goroutine (and may run
+	// concurrently across the .events and .supervisor subscriptions) before
+	// the terminal is recorded in terminals, so it finishes before
+	// waitTerminal or terminalsOf can observe that terminal. It must not call
+	// t.Fatal/t.FailNow, or waitTerminal for the same task (which would
+	// deadlock).
 	onTerminal func(taskID string)
 }
 
@@ -228,12 +236,12 @@ func (b *bus) onEvent(msg *nats.Msg) {
 	if su.Status.Message != nil && len(su.Status.Message.Parts) > 0 {
 		text = su.Status.Message.Parts[0].Text
 	}
-	b.mu.Lock()
-	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session, class})
-	b.mu.Unlock()
 	if b.onTerminal != nil {
 		b.onTerminal(env.TaskID)
 	}
+	b.mu.Lock()
+	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session, class})
+	b.mu.Unlock()
 }
 
 func (b *bus) terminalsOf(taskID string) []terminalSeen {
@@ -255,6 +263,95 @@ func (b *bus) waitTerminal(taskID string, within time.Duration) terminalSeen {
 		return false
 	})
 	return got
+}
+
+// onTerminal finishes before the terminal is visible in terminalsOf or wakes
+// waitTerminal, so a test does not race past its own callback's check and tear
+// the bus down mid-query.
+func TestOnTerminalFinishesBeforeWaitTerminalReturns(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unlock := func() { releaseOnce.Do(func() { close(release) }) }
+
+	b := newBus(t, "tse-0")
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	if ok, err := b.hasTombstone(key); err != nil || ok {
+		t.Fatalf("missing key: hasTombstone = (%v, %v), want (false, nil)", ok, err)
+	}
+	b.putUnreadable("tse", "read", "tse-0", "task-1")
+	if ok, err := b.hasTombstone(key); err == nil || ok {
+		t.Fatalf("unreadable record: hasTombstone = (%v, %v), want (false, err)", ok, err)
+	}
+	b.putRecord("tse", "read", "tse-0", "task-1", time.Now().Add(time.Minute))
+	if ok, err := b.hasTombstone(key); err != nil || ok {
+		t.Fatalf("running lease: hasTombstone = (%v, %v), want (false, nil)", ok, err)
+	}
+	b.putTombstone("tse", "read", "tse-0", "task-1", time.Now())
+
+	var (
+		once              sync.Once
+		visibleDuringHook atomic.Bool
+		hookTombstoned    atomic.Bool
+		hookFinished      atomic.Bool
+		hookErr           error
+	)
+	b.onTerminal = func(taskID string) {
+		if taskID != "task-1" {
+			return
+		}
+		once.Do(func() {
+			close(entered)
+			<-release
+			ok, err := b.hasTombstone(key)
+			hookErr = err
+			hookTombstoned.Store(ok)
+			visibleDuringHook.Store(len(b.terminalsOf(taskID)) > 0)
+			hookFinished.Store(true)
+		})
+	}
+	w := b.worker("tse", "read", "tse-0", answerSilent, 0)
+	t.Cleanup(unlock)
+
+	w.terminal("task-1", lib.StateCompleted)
+	select {
+	case <-entered:
+	case <-time.After(terminalHookWait):
+		t.Fatal("timed out waiting for onTerminal to start")
+	}
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Fatalf("terminalsOf observed %+v before onTerminal returned", ts)
+	}
+
+	helperDone := make(chan struct{})
+	t.Cleanup(func() {
+		unlock()
+		<-helperDone
+	})
+	go func() {
+		defer close(helperDone)
+		select {
+		case <-release:
+		case <-time.After(terminalHookHold):
+			unlock()
+		}
+	}()
+	ts := b.waitTerminal("task-1", terminalHookWait)
+	if !hookFinished.Load() {
+		t.Fatal("waitTerminal returned before onTerminal finished")
+	}
+	if hookErr != nil {
+		t.Fatalf("hasTombstone in onTerminal: %v", hookErr)
+	}
+	if !hookTombstoned.Load() {
+		t.Fatal("hasTombstone in onTerminal did not observe the tombstone")
+	}
+	if visibleDuringHook.Load() {
+		t.Fatal("terminal was recorded in terminals before onTerminal finished")
+	}
+	if ts.state != lib.StateCompleted {
+		t.Fatalf("terminal = %+v, want %s", ts, lib.StateCompleted)
+	}
 }
 
 // ensure creates the operator's durables for profile at every tier.
@@ -332,6 +429,28 @@ func (b *bus) leases() map[string]lib.LeaseRecord {
 		}
 	}
 	return out
+}
+
+// hasTombstone reports whether key holds a finished record in the lease bucket,
+// without calling b.t.Fatal (safe on onTerminal's subscription goroutine) or
+// creating a ListKeys consumer.
+func (b *bus) hasTombstone(key string) (bool, error) {
+	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
+	if err != nil {
+		return false, err
+	}
+	e, err := kv.Get(b.ctx, key)
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var rec lib.LeaseRecord
+	if err := json.Unmarshal(e.Value(), &rec); err != nil {
+		return false, err
+	}
+	return rec.Finished(), nil
 }
 
 // tombstones lists the lease bucket's tombstones by key.
