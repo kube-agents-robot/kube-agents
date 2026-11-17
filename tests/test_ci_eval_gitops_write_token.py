@@ -149,7 +149,7 @@ class GitopsWriteTokenTest(_Harness):
         self.assertIn(f"EXPORTED={self.tmp / 'unit.gitops-token'}", out)
         self.assertIn("AT_LAUNCH=tok-write-1", out)
         self.assertIn("MODE=600", out)
-        self.assertRegex(out, r"RENEWED=tok-write-[2-9]")
+        self.assertRegex(out, r"RENEWED=tok-write-(?:[2-9]|[1-9][0-9]+)\n")
         self.assertIn("RENEWER=gone", out)
         self.assertIn("FILE=removed", out)
         self.assertIn("UNSET=\n", out + "\n")
