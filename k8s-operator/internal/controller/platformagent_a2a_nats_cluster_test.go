@@ -50,9 +50,18 @@ const (
 	// route port fails the test.
 	a2aClusterStartAttempts = 3
 
-	// a2aServerReadyTimeout is how long a2aTryStartRenderedCluster waits for
-	// each server to listen.
+	// a2aServerReadyTimeout is how long a2aWaitForClusterServer waits for each
+	// server to listen.
 	a2aServerReadyTimeout = 10 * time.Second
+
+	// a2aServerReadyPollInterval is the step at which a2aWaitForClusterServer
+	// polls ReadyForConnections while watching the server log for a route-port
+	// bind error.
+	a2aServerReadyPollInterval = 25 * time.Millisecond
+
+	// a2aRouteListenErrPrefix is the Fatalf line nats-server logs in
+	// startRouteAcceptLoop when its route port cannot be bound.
+	a2aRouteListenErrPrefix = "Error listening on router port:"
 )
 
 // a2aTestAgentWithBusReplicas is a2aTestAgent with spec.harness.tuning.busReplicas set.
@@ -419,12 +428,12 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		t.Fatalf("the cluster block does not route to %s", routeHost)
 	}
 
-	servers := a2aStartRenderedClusterOn(t, conf, routeHost, a2aFreePort)
+	servers := a2aStartRenderedCluster(t, conf, routeHost)
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		formed := true
 		for _, s := range servers {
-			if len(a2aRoutePeers(t, s)) != 2 || !s.JetStreamIsClustered() || s.NumRoutes() != 2 {
+			if len(a2aRoutePeers(t, s)) != 2 || !s.JetStreamIsClustered() {
 				formed = false
 			}
 		}
@@ -434,17 +443,22 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			for i, s := range servers {
-				t.Logf("server %d: peers %v, routes=%d, clustered=%v, leader=%v", i, a2aRoutePeers(t, s), s.NumRoutes(), s.JetStreamIsClustered(), s.JetStreamIsLeader())
+				t.Logf("server %d: peers %v, clustered=%v, leader=%v", i, a2aRoutePeers(t, s), s.JetStreamIsClustered(), s.JetStreamIsLeader())
 			}
 			t.Fatal("the rendered cluster did not form with a JetStream meta leader within 20s")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	for i, s := range servers {
-		if !s.JetStreamIsClustered() {
-			t.Errorf("server %d is not running clustered JetStream", i)
+	// One route per peer (pool_size -1): two, not a pool of four. Simultaneous
+	// dials during formation can briefly open a duplicate route until the peers
+	// resolve it, so let the count settle before asserting.
+	for time.Now().Before(deadline) {
+		if !slices.ContainsFunc(servers, func(s *natsserver.Server) bool { return s.NumRoutes() != 2 }) {
+			break
 		}
-		// One route per peer (pool_size -1): two, not a pool of four.
+		time.Sleep(100 * time.Millisecond)
+	}
+	for i, s := range servers {
 		if n := s.NumRoutes(); n != 2 {
 			t.Errorf("server %d holds %d route connections, want exactly one per peer (2)", i, n)
 		}
@@ -521,23 +535,9 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var intruder *natsserver.Server
-	for attempt := 1; ; attempt++ {
-		s := a2aStartRenderedClusterServer(t, conf, routeHost, a2aNATSMaxReplicas, servers[0].ClusterAddr().Port, a2aFreePort(t), foreignCA)
-		if s.ReadyForConnections(a2aServerReadyTimeout) {
-			intruder = s
-			break
-		}
-		client, route := s.Addr(), s.ClusterAddr()
-		s.Shutdown()
-		s.WaitForShutdown()
-		if client == nil || route != nil {
-			t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", s.Name(), client, route)
-		}
-		if attempt == a2aClusterStartAttempts {
-			t.Fatalf("each of %d intruder starts had a server that never bound its route port (last: %s)", a2aClusterStartAttempts, s.Name())
-		}
-		t.Logf("nats-server %s never bound its route port; starting again on a fresh port", s.Name())
+	intruder, intruderLog := a2aStartRenderedClusterServer(t, conf, routeHost, a2aNATSMaxReplicas, servers[0].ClusterAddr().Port, -1, foreignCA)
+	if !a2aWaitForClusterServer(intruder, intruderLog) {
+		t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", intruder.Name(), intruder.Addr(), intruder.ClusterAddr())
 	}
 	time.Sleep(3 * time.Second)
 	if peers := a2aRoutePeers(t, intruder); len(peers) != 0 {
@@ -552,9 +552,10 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 
 // a2aStartRenderedClusterServer starts one embedded server from the rendered
 // cluster nats.conf, routing to localhost:seedPort and listening for routes on
-// routePort. tlsDir, when set, is a serving pair from another CA: a server
-// that can reach 6222 but does not hold the bus's serving key.
-func a2aStartRenderedClusterServer(t *testing.T, conf, routeHost string, ordinal, seedPort, routePort int, tlsDir string) *natsserver.Server {
+// routePort (-1 for an ephemeral port). tlsDir, when set, is a serving pair
+// from another CA: a server that can reach 6222 but does not hold the bus's
+// serving key.
+func a2aStartRenderedClusterServer(t *testing.T, conf, routeHost string, ordinal, seedPort, routePort int, tlsDir string) (*natsserver.Server, *a2aServerLog) {
 	t.Helper()
 	c := strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-"+strconv.Itoa(ordinal), 1)
 	c = strings.Replace(c, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, 1)
@@ -576,14 +577,60 @@ func a2aStartRenderedClusterServer(t *testing.T, conf, routeHost string, ordinal
 	opts.Port, opts.HTTPPort, opts.Websocket.Port = -1, 0, 0
 	opts.Host, opts.Cluster.Host = "127.0.0.1", "127.0.0.1"
 	opts.StoreDir = t.TempDir()
-	opts.NoLog, opts.NoSigs = true, true
+	opts.NoSigs = true
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
 		t.Fatalf("server %d: %v", ordinal, err)
 	}
+	log := &a2aServerLog{}
+	s.SetLoggerV2(log, false, false, false)
 	go s.Start()
 	t.Cleanup(func() { s.Shutdown(); s.WaitForShutdown() })
-	return s
+	return s, log
+}
+
+// a2aWaitForClusterServer waits up to a2aServerReadyTimeout for s to accept
+// client and route connections, returning early once startRouteAcceptLoop logs
+// a route-port listen error (nats-server's ReadyForConnections polls until its
+// full deadline before inspecting routeListenerErr).
+func a2aWaitForClusterServer(s *natsserver.Server, log *a2aServerLog) bool {
+	deadline := time.Now().Add(a2aServerReadyTimeout)
+	for time.Now().Before(deadline) {
+		if s.ReadyForConnections(a2aServerReadyPollInterval) {
+			return true
+		}
+		if s.Addr() != nil && s.ClusterAddr() == nil && a2aHasRouteListenErr(log) {
+			return false
+		}
+	}
+	return s.ReadyForConnections(0)
+}
+
+func a2aHasRouteListenErr(log *a2aServerLog) bool {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	for _, line := range log.lines {
+		if strings.Contains(line, a2aRouteListenErrPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aStartRenderedCluster starts a three-server cluster from the rendered
+// nats.conf. Only server 0 (the route seed in nats.conf) needs a pre-picked
+// port; servers 1 and 2 use port -1 so nats-server binds an ephemeral route
+// port directly without releasing a listener in between.
+func a2aStartRenderedCluster(t *testing.T, conf, routeHost string) []*natsserver.Server {
+	t.Helper()
+	i := 0
+	return a2aStartRenderedClusterOn(t, conf, routeHost, func(t *testing.T) int {
+		defer func() { i++ }()
+		if i%a2aNATSMaxReplicas == 0 {
+			return a2aFreePort(t)
+		}
+		return -1
+	})
 }
 
 // a2aStartRenderedClusterOn starts a three-server cluster from the rendered
@@ -619,22 +666,27 @@ func a2aTryStartRenderedCluster(t *testing.T, conf, routeHost string, pick func(
 		ports[i] = pick(t)
 	}
 	servers := make([]*natsserver.Server, a2aNATSMaxReplicas)
+	logs := make([]*a2aServerLog, a2aNATSMaxReplicas)
 	for i := range servers {
-		servers[i] = a2aStartRenderedClusterServer(t, conf, routeHost, i, ports[0], ports[i], "")
+		servers[i], logs[i] = a2aStartRenderedClusterServer(t, conf, routeHost, i, ports[0], ports[i], "")
 	}
-	for _, s := range servers {
-		if s.ReadyForConnections(a2aServerReadyTimeout) {
+	var unrouted *natsserver.Server
+	for i, s := range servers {
+		if a2aWaitForClusterServer(s, logs[i]) {
 			continue
 		}
 		// A server binds its route port right after its client port, so one
 		// that listens only for clients lost its route port.
 		client, route := s.Addr(), s.ClusterAddr()
 		if client != nil && route == nil {
-			return servers, s
+			if unrouted == nil {
+				unrouted = s
+			}
+			continue
 		}
 		t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", s.Name(), client, route)
 	}
-	return servers, nil
+	return servers, unrouted
 }
 
 // TestStartRenderedClusterStartsAgainWhenARoutePortIsTaken pins the #5056
@@ -656,17 +708,31 @@ func TestStartRenderedClusterStartsAgainWhenARoutePortIsTaken(t *testing.T) {
 	defer func() { _ = held.Close() }()
 	heldPort := held.Addr().(*net.TCPAddr).Port
 	picks := 0
+	abortedPort := 0
 	pick := func(t *testing.T) int {
 		picks++
-		if picks == 1 {
+		switch picks {
+		case 1:
 			return heldPort
+		case 2:
+			abortedPort = a2aFreePort(t)
+			return abortedPort
+		default:
+			return a2aFreePort(t)
 		}
-		return a2aFreePort(t)
 	}
 	servers := a2aStartRenderedClusterOn(t, conf, routeHost, pick)
 	if picks < 2*a2aNATSMaxReplicas {
 		t.Fatalf("picked %d route ports, want at least %d: the cluster with the held port was not started again", picks, 2*a2aNATSMaxReplicas)
 	}
+	if abortedPort == 0 {
+		t.Fatal("first attempt did not pick a route port for server 1")
+	}
+	rebound, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(abortedPort))
+	if err != nil {
+		t.Fatalf("first attempt's server 1 route port %d is still in use after a2aStartRenderedClusterOn returned: %v", abortedPort, err)
+	}
+	_ = rebound.Close()
 	for _, s := range servers {
 		if s.ClusterAddr() == nil {
 			t.Fatalf("nats-server %s has no route listener", s.Name())
