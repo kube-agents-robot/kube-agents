@@ -5,14 +5,18 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -49,25 +53,44 @@ import (
 const (
 	a2aClusterTestNetV4               = "tcp4"
 	a2aClusterTestNetV6               = "tcp6"
+	a2aClusterTestDNSNetUDP4          = "udp4"
+	a2aClusterTestDNSNetTCPPrefix     = "tcp"
 	a2aClusterTestLoopbackV4          = "127.0.0.1"
 	a2aClusterTestLoopbackV6          = "::1"
 	a2aClusterTestAnyPort             = "0"
+	a2aClusterTestRouteDNSName        = "a2a.route.seed.nats.test.localhost"
+	a2aClusterTestUnknownDNSName      = "unconfigured.route.seed.nats.test.localhost"
 	a2aClusterTestServerNameDirective = "server_name: $POD_NAME"
 	a2aClusterTestServerNamePrefix    = "server_name: a2a-test-nats-"
 	a2aClusterTestIntruderServerName  = "a2a-test-nats-3"
 	a2aClusterTestPIDFileName         = "pid"
 	a2aClusterTestConfFileName        = "nats.conf"
+	a2aClusterTestSeedUser            = "seed"
 	a2aClusterTestConfigPerm          = 0o600
 	a2aClusterTestSeedBindRetries     = 5
+	a2aClusterTestWantPeerCount       = 2
 	a2aClusterTestSeedReadyTimeout    = 5 * time.Second
 	a2aClusterTestServerReadyTimeout  = 10 * time.Second
 	a2aClusterTestFormTimeout         = 20 * time.Second
+	a2aClusterTestRouteSettleTimeout  = 2 * time.Second
 	a2aClusterTestPollInterval        = 50 * time.Millisecond
 	a2aClusterTestSettledPolls        = 3
 	a2aClusterTestRejectTimeout       = 10 * time.Second
 	a2aClusterTestRejectPollInterval  = 20 * time.Millisecond
 	a2aClusterTestForwardDialTimeout  = 2 * time.Second
 	a2aClusterTestTLSHandshakeErr     = "TLS route handshake error"
+	a2aClusterTestForwardPayload      = "nats-route-probe"
+	a2aClusterTestDNSBufSize          = 512
+	a2aClusterTestDNSHeaderLen        = 12
+	a2aClusterTestDNSLabelMax         = 63
+	a2aClusterTestDNSQTailLen         = 4
+	a2aClusterTestDNSTypeA            = 1
+	a2aClusterTestDNSClassIN          = 1
+	a2aClusterTestDNSFlagsNoError     = 0x8180
+	a2aClusterTestDNSFlagsNXDomain    = 0x8183
+	a2aClusterTestDNSNamePtr          = 0xc00c
+	a2aClusterTestDNSTTLSeconds       = 60
+	a2aClusterTestDNSIPv4Len          = 4
 )
 
 // a2aTestAgentWithBusReplicas is a2aTestAgent with spec.harness.tuning.busReplicas set.
@@ -434,6 +457,46 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		t.Fatalf("the cluster block does not route to %s", routeHost)
 	}
 
+	// Probe IPv6 loopback once. Dual-stack hosts bridge [::1]:seedPort to
+	// 127.0.0.1:seedPort while keeping localhost in routes; IPv4-only Linux pods
+	// whose /etc/hosts still maps "::1 localhost" resolve a dedicated route DNS
+	// name to 127.0.0.1 alone so saveRouteTLSName stays active without ::1 retry
+	// stalls or server 0 self-solicitation loops.
+	probeV6, hasV6, _ := a2aListenIPv6Loopback(0)
+	if probeV6 != nil {
+		_ = probeV6.Close()
+	}
+	routeTargetHost := a2aTestServerName
+	busTLSDir, busPool := a2aTestTLSMaterial(t)
+	if !hasV6 {
+		if !strings.Contains(conf, a2aNATSTLSMountDir+"/") {
+			t.Fatalf("the rendered nats.conf names nothing under %s; the TLS substitution would be inert", a2aNATSTLSMountDir)
+		}
+		ip4Resolver := a2aStartIPv4RouteDNS(t, a2aClusterTestRouteDNSName)
+		prevResolver := net.DefaultResolver
+		net.DefaultResolver = ip4Resolver
+		t.Cleanup(func() { net.DefaultResolver = prevResolver })
+
+		now := time.Now()
+		caCert, caKey, caPEM, _, err := generateA2ANATSCA(now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, []string{a2aTestServerName, a2aClusterTestRouteDNSName}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		busTLSDir = t.TempDir()
+		for name, b := range map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: caPEM} {
+			if err := os.WriteFile(filepath.Join(busTLSDir, name), b, a2aClusterTestConfigPerm); err != nil {
+				t.Fatal(err)
+			}
+		}
+		busPool = x509.NewCertPool()
+		busPool.AddCert(caCert)
+		routeTargetHost = a2aClusterTestRouteDNSName
+	}
+
 	// newServer builds and starts embedded server i against seedPort, binding
 	// routePort on 127.0.0.1 (-1 for kernel-assigned ephemeral peer ports).
 	// tlsDir, when set, is a serving pair from another CA: a server that can
@@ -442,11 +505,14 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		t.Helper()
 		c := strings.Replace(conf, a2aClusterTestServerNameDirective, a2aClusterTestServerNamePrefix+strconv.Itoa(i), 1)
 		c = strings.Replace(c, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), a2aClusterTestPIDFileName)+`"`, 1)
-		c = strings.Replace(c, routeHost, net.JoinHostPort(a2aTestServerName, strconv.Itoa(seedPort)), 1)
-		if tlsDir != "" {
+		c = strings.Replace(c, routeHost, net.JoinHostPort(routeTargetHost, strconv.Itoa(seedPort)), 1)
+		switch {
+		case tlsDir != "":
 			c = strings.ReplaceAll(c, a2aNATSTLSMountDir+"/", tlsDir+"/")
-		} else {
+		case hasV6:
 			c = a2aWithTestTLS(t, c)
+		default:
+			c = strings.ReplaceAll(c, a2aNATSTLSMountDir+"/", busTLSDir+"/")
 		}
 		path := filepath.Join(t.TempDir(), a2aClusterTestConfFileName)
 		if err := os.WriteFile(path, []byte(c), a2aClusterTestConfigPerm); err != nil {
@@ -455,6 +521,9 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		opts, err := natsserver.ProcessConfigFile(path)
 		if err != nil {
 			t.Fatalf("server %d: the rendered nats.conf does not parse: %v", i, err)
+		}
+		if opts.Cluster.Port != a2aNATSRoutePort {
+			t.Fatalf("server %d: rendered cluster port = %d, want %d", i, opts.Cluster.Port, a2aNATSRoutePort)
 		}
 		opts.Port, opts.HTTPPort, opts.Websocket.Port = -1, 0, 0
 		opts.Host, opts.Cluster.Host = a2aClusterTestLoopbackV4, a2aClusterTestLoopbackV4
@@ -471,10 +540,10 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		return s, log
 	}
 
-	// Start server 0 first on a reserved 127.0.0.1 port, and when IPv6 loopback
-	// is available hold [::1]:seedPort open to forward route solicitations to
-	// 127.0.0.1:seedPort so localhost resolution neither drops saveRouteTLSName
-	// nor stalls on ::1 ECONNREFUSED retries.
+	// Start server 0 first on a reserved 127.0.0.1 port, and on dual-stack hosts
+	// hold [::1]:seedPort open to forward route solicitations to 127.0.0.1:seedPort
+	// so localhost resolution neither drops saveRouteTLSName nor stalls on ::1
+	// ECONNREFUSED retries.
 	var (
 		seedPort int
 		seedSrv  *natsserver.Server
@@ -486,7 +555,10 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 			t.Fatalf("reserving IPv4 seed route port: %v", err)
 		}
 		candidatePort := v4Probe.Addr().(*net.TCPAddr).Port
-		v6Ln, _, err := a2aListenIPv6Loopback(candidatePort)
+		var v6Ln net.Listener
+		if hasV6 {
+			v6Ln, _, err = a2aListenIPv6Loopback(candidatePort)
+		}
 		_ = v4Probe.Close()
 		if err != nil {
 			t.Logf("seed route port %d busy on IPv6 loopback (attempt %d): %v", candidatePort, attempt+1, err)
@@ -534,7 +606,7 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		formed := true
 		leaders := 0
 		for _, s := range servers {
-			if !s.JetStreamIsClustered() || s.NumRoutes() != 2 || len(a2aRoutePeers(t, s)) != 2 {
+			if !s.JetStreamIsClustered() || len(a2aRoutePeers(t, s)) != a2aClusterTestWantPeerCount {
 				formed = false
 			}
 			if s.JetStreamIsLeader() {
@@ -559,13 +631,34 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		}
 		time.Sleep(a2aClusterTestPollInterval)
 	}
-	for i, s := range servers {
-		if !s.JetStreamIsClustered() {
-			t.Errorf("server %d is not running clustered JetStream", i)
+
+	// Wait briefly for any transient crossed implicit route (reConnectToRoute)
+	// to close before checking pool_size: -1 route count, without masking a
+	// pool_size regression behind the 20s meta-leader timeout.
+	routeSettleDeadline := time.Now().Add(a2aClusterTestRouteSettleTimeout)
+	routesSettled := 0
+	for time.Now().Before(routeSettleDeadline) {
+		allSingleRoutePerPeer := true
+		for _, s := range servers {
+			if s.NumRoutes() != a2aClusterTestWantPeerCount {
+				allSingleRoutePerPeer = false
+				break
+			}
 		}
-		// One route per peer (pool_size -1): two, not a pool of four.
-		if n := s.NumRoutes(); n != 2 {
-			t.Errorf("server %d holds %d route connections, want exactly one per peer (2)", i, n)
+		if allSingleRoutePerPeer {
+			routesSettled++
+			if routesSettled >= a2aClusterTestSettledPolls {
+				break
+			}
+		} else {
+			routesSettled = 0
+		}
+		time.Sleep(a2aClusterTestPollInterval)
+	}
+	// One route per peer (pool_size -1): two, not a pool of four.
+	for i, s := range servers {
+		if n := s.NumRoutes(); n != a2aClusterTestWantPeerCount {
+			t.Errorf("server %d holds %d route connections, want exactly one per peer (%d)", i, n, a2aClusterTestWantPeerCount)
 		}
 	}
 
@@ -574,9 +667,10 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	// missing a peer's interest would see "no responders" for every stream
 	// that peer leads, which is the failure pool_size -1 exists for.
 	seedPassword := string(creds.Data[a2aSeedPasswordKey])
+	clientTLS := nats.Secure(&tls.Config{RootCAs: busPool, ServerName: a2aTestServerName, MinVersion: tls.VersionTLS12})
 	connect := func(s *natsserver.Server) *nats.Conn {
 		t.Helper()
-		nc, err := nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo("seed", seedPassword))
+		nc, err := nats.Connect(s.ClientURL(), clientTLS, nats.UserInfo(a2aClusterTestSeedUser, seedPassword))
 		if err != nil {
 			t.Fatalf("connect as seed to %s: %v", s.Name(), err)
 		}
@@ -622,7 +716,6 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	// bus server succeeds and the refusal, if any, is the bus server's check
 	// of its certificate (verify: true), which is what this exercises.
 	foreignCA := t.TempDir()
-	busTLSDir, _ := a2aTestTLSMaterial(t)
 	busCAPEM, err := os.ReadFile(filepath.Join(busTLSDir, a2aNATSTLSCAKey))
 	if err != nil {
 		t.Fatal(err)
@@ -631,12 +724,12 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, []string{a2aTestServerName}, time.Now())
+	_, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, []string{routeTargetHost}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	for name, data := range map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: busCAPEM} {
-		if err := os.WriteFile(filepath.Join(foreignCA, name), data, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(foreignCA, name), data, a2aClusterTestConfigPerm); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -657,7 +750,7 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		t.Errorf("a server with a certificate from another CA joined, peering with %v", peers)
 	}
 	for i, s := range servers {
-		if peers := a2aRoutePeers(t, s); len(peers) != 2 || slices.Contains(peers, a2aClusterTestIntruderServerName) {
+		if peers := a2aRoutePeers(t, s); len(peers) != a2aClusterTestWantPeerCount || slices.Contains(peers, a2aClusterTestIntruderServerName) {
 			t.Errorf("server %d peers with %v after the intruder tried, want its two members only", i, peers)
 		}
 	}
@@ -785,6 +878,145 @@ func a2aForwardLoopback(ln net.Listener, targetAddr string) func() {
 	}
 }
 
+// a2aStartIPv4RouteDNS starts a loopback UDP/TCP DNS responder that answers
+// A=127.0.0.1 (and empty NOERROR for AAAA) for wantHost and NXDOMAIN otherwise,
+// returning a pure-Go Resolver bound to those listeners.
+func a2aStartIPv4RouteDNS(t *testing.T, wantHost string) *net.Resolver {
+	t.Helper()
+	udpConn, err := net.ListenPacket(a2aClusterTestDNSNetUDP4, net.JoinHostPort(a2aClusterTestLoopbackV4, a2aClusterTestAnyPort))
+	if err != nil {
+		t.Fatalf("listening on UDP loopback for route DNS: %v", err)
+	}
+	tcpLn, err := net.Listen(a2aClusterTestNetV4, net.JoinHostPort(a2aClusterTestLoopbackV4, a2aClusterTestAnyPort))
+	if err != nil {
+		_ = udpConn.Close()
+		t.Fatalf("listening on TCP loopback for route DNS: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		_ = udpConn.Close()
+		_ = tcpLn.Close()
+		wg.Wait()
+	})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, a2aClusterTestDNSBufSize)
+		for {
+			n, addr, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if reply, ok := a2aBuildDNSReply(buf[:n], wantHost); ok {
+				_, _ = udpConn.WriteTo(reply, addr)
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := tcpLn.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				defer func() { _ = c.Close() }()
+				_ = c.SetDeadline(time.Now().Add(a2aClusterTestForwardDialTimeout))
+				var lenHdr [2]byte
+				if _, err := io.ReadFull(c, lenHdr[:]); err != nil {
+					return
+				}
+				msgLen := int(binary.BigEndian.Uint16(lenHdr[:]))
+				req := make([]byte, msgLen)
+				if _, err := io.ReadFull(c, req); err != nil {
+					return
+				}
+				reply, ok := a2aBuildDNSReply(req, wantHost)
+				if !ok || len(reply) > math.MaxUint16 {
+					return
+				}
+				binary.BigEndian.PutUint16(lenHdr[:], uint16(len(reply)))
+				_, _ = c.Write(append(lenHdr[:], reply...))
+			}(conn)
+		}
+	}()
+
+	udpAddr := udpConn.LocalAddr().String()
+	tcpAddr := tcpLn.Addr().String()
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			if strings.HasPrefix(network, a2aClusterTestDNSNetTCPPrefix) {
+				return (&net.Dialer{}).DialContext(ctx, a2aClusterTestNetV4, tcpAddr)
+			}
+			return (&net.Dialer{}).DialContext(ctx, a2aClusterTestDNSNetUDP4, udpAddr)
+		},
+	}
+}
+
+func a2aBuildDNSReply(req []byte, wantHost string) ([]byte, bool) {
+	if len(req) < a2aClusterTestDNSHeaderLen || binary.BigEndian.Uint16(req[4:6]) == 0 {
+		return nil, false
+	}
+	pos := a2aClusterTestDNSHeaderLen
+	var labels []string
+	for {
+		if pos >= len(req) {
+			return nil, false
+		}
+		labelLen := int(req[pos])
+		pos++
+		if labelLen == 0 {
+			break
+		}
+		if labelLen > a2aClusterTestDNSLabelMax || pos+labelLen > len(req) {
+			return nil, false
+		}
+		labels = append(labels, string(req[pos:pos+labelLen]))
+		pos += labelLen
+	}
+	if pos+a2aClusterTestDNSQTailLen > len(req) {
+		return nil, false
+	}
+	qType := binary.BigEndian.Uint16(req[pos : pos+2])
+	qClass := binary.BigEndian.Uint16(req[pos+2 : pos+a2aClusterTestDNSQTailLen])
+	qEnd := pos + a2aClusterTestDNSQTailLen
+	matched := strings.EqualFold(strings.Join(labels, "."), wantHost)
+
+	resp := make([]byte, qEnd, qEnd+16)
+	copy(resp, req[:qEnd])
+	flags := uint16(a2aClusterTestDNSFlagsNXDomain)
+	anCount := uint16(0)
+	if matched {
+		flags = a2aClusterTestDNSFlagsNoError
+		if qType == a2aClusterTestDNSTypeA && qClass == a2aClusterTestDNSClassIN {
+			anCount = 1
+		}
+	}
+	binary.BigEndian.PutUint16(resp[2:4], flags)
+	binary.BigEndian.PutUint16(resp[4:6], 1)
+	binary.BigEndian.PutUint16(resp[6:8], anCount)
+	binary.BigEndian.PutUint16(resp[8:10], 0)
+	binary.BigEndian.PutUint16(resp[10:12], 0)
+	if anCount == 1 {
+		var rr [16]byte
+		binary.BigEndian.PutUint16(rr[0:2], a2aClusterTestDNSNamePtr)
+		binary.BigEndian.PutUint16(rr[2:4], a2aClusterTestDNSTypeA)
+		binary.BigEndian.PutUint16(rr[4:6], a2aClusterTestDNSClassIN)
+		binary.BigEndian.PutUint32(rr[6:10], a2aClusterTestDNSTTLSeconds)
+		binary.BigEndian.PutUint16(rr[10:12], a2aClusterTestDNSIPv4Len)
+		copy(rr[12:16], net.ParseIP(a2aClusterTestLoopbackV4).To4())
+		resp = append(resp, rr[:]...)
+	}
+	return resp, true
+}
+
 // a2aForwardLoopback relays connections from [::1] (or an IPv4 listener on
 // IPv4-only hosts) to a 127.0.0.1 target and tears down active streams on stop.
 func TestTheLoopbackForwarderBridgesIPv6ToIPv4(t *testing.T) {
@@ -846,8 +1078,7 @@ func TestTheLoopbackForwarderBridgesIPv6ToIPv4(t *testing.T) {
 	if err := clientConn.SetDeadline(time.Now().Add(a2aClusterTestForwardDialTimeout)); err != nil {
 		t.Fatal(err)
 	}
-	const wantPayload = "nats-route-probe"
-	if _, err := io.WriteString(clientConn, wantPayload); err != nil {
+	if _, err := io.WriteString(clientConn, a2aClusterTestForwardPayload); err != nil {
 		t.Fatalf("writing through forwarder: %v", err)
 	}
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
@@ -857,18 +1088,69 @@ func TestTheLoopbackForwarderBridgesIPv6ToIPv4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading echoed payload from forwarder: %v", err)
 	}
-	if got := string(gotBytes); got != wantPayload {
-		t.Errorf("forwarded payload = %q, want %q", got, wantPayload)
+	if got := string(gotBytes); got != a2aClusterTestForwardPayload {
+		t.Errorf("forwarded payload = %q, want %q", got, a2aClusterTestForwardPayload)
 	}
 
 	idleConn, err := net.DialTimeout(dialNet, frontAddr, a2aClusterTestForwardDialTimeout)
 	if err != nil {
-		t.Fatalf("dialling idle connection: %v", err)
+		t.Fatalf("dialling active connection for teardown check: %v", err)
 	}
 	defer func() { _ = idleConn.Close() }()
+	if err := idleConn.SetDeadline(time.Now().Add(a2aClusterTestForwardDialTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	// Round-trip one payload without CloseWrite so both forwarder legs are
+	// registered in conns and blocked in io.Copy when stopForward runs.
+	if _, err := io.WriteString(idleConn, a2aClusterTestForwardPayload); err != nil {
+		t.Fatalf("writing on active connection before stop: %v", err)
+	}
+	echoBuf := make([]byte, len(a2aClusterTestForwardPayload))
+	if _, err := io.ReadFull(idleConn, echoBuf); err != nil {
+		t.Fatalf("reading echoed payload before stop: %v", err)
+	}
 	stopForward()
+	var eofBuf [1]byte
+	if n, err := idleConn.Read(eofBuf[:]); n != 0 || !stderrors.Is(err, io.EOF) {
+		t.Errorf("reading active connection after stop = (%d, %v), want (0, io.EOF)", n, err)
+	}
 	if _, err := net.DialTimeout(dialNet, frontAddr, a2aClusterTestForwardDialTimeout); err == nil {
 		t.Error("forwarder accepted a connection after stop")
+	}
+}
+
+func TestTheIPv4RouteDNSResponderAnswersLoopbackOnly(t *testing.T) {
+	resolver := a2aStartIPv4RouteDNS(t, a2aClusterTestRouteDNSName)
+	ctx, cancel := context.WithTimeout(context.Background(), a2aClusterTestForwardDialTimeout)
+	defer cancel()
+
+	addrs, err := resolver.LookupHost(ctx, a2aClusterTestRouteDNSName)
+	if err != nil {
+		t.Fatalf("LookupHost(%q): %v", a2aClusterTestRouteDNSName, err)
+	}
+	if !slices.Equal(addrs, []string{a2aClusterTestLoopbackV4}) {
+		t.Errorf("LookupHost(%q) = %v, want [%s]", a2aClusterTestRouteDNSName, addrs, a2aClusterTestLoopbackV4)
+	}
+
+	tcpOnlyResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, address string) (net.Conn, error) {
+			return resolver.Dial(ctx, a2aClusterTestNetV4, address)
+		},
+	}
+	tcpAddrs, err := tcpOnlyResolver.LookupHost(ctx, a2aClusterTestRouteDNSName)
+	if err != nil {
+		t.Fatalf("TCP LookupHost(%q): %v", a2aClusterTestRouteDNSName, err)
+	}
+	if !slices.Equal(tcpAddrs, []string{a2aClusterTestLoopbackV4}) {
+		t.Errorf("TCP LookupHost(%q) = %v, want [%s]", a2aClusterTestRouteDNSName, tcpAddrs, a2aClusterTestLoopbackV4)
+	}
+
+	if _, err := resolver.LookupHost(ctx, a2aClusterTestUnknownDNSName); err == nil {
+		t.Errorf("LookupHost(%q) succeeded, want NXDOMAIN error", a2aClusterTestUnknownDNSName)
+	}
+	if _, ok := a2aBuildDNSReply(nil, a2aClusterTestRouteDNSName); ok {
+		t.Error("a2aBuildDNSReply accepted empty packet")
 	}
 }
 
