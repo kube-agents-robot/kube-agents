@@ -228,12 +228,12 @@ func (b *bus) onEvent(msg *nats.Msg) {
 	if su.Status.Message != nil && len(su.Status.Message.Parts) > 0 {
 		text = su.Status.Message.Parts[0].Text
 	}
-	b.mu.Lock()
-	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session, class})
-	b.mu.Unlock()
 	if b.onTerminal != nil {
 		b.onTerminal(env.TaskID)
 	}
+	b.mu.Lock()
+	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session, class})
+	b.mu.Unlock()
 }
 
 func (b *bus) terminalsOf(taskID string) []terminalSeen {

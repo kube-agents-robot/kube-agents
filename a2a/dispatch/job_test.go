@@ -158,11 +158,15 @@ func TestAJobNoWorkerIsTombstonedBeforeItsTerminal(t *testing.T) {
 	b := newBus(t)
 	b.ensure("inv", 1, 0, "unattended")
 	key := lib.ProfileLeaseKey("inv", "unattended", lib.ProfileLeaseRefusedPod, "task-1")
+	var once sync.Once
 	var seen, tombstoned atomic.Bool
 	b.onTerminal = func(taskID string) {
-		if taskID == "task-1" && !seen.Swap(true) {
-			_, ok := b.tombstones()[key]
-			tombstoned.Store(ok)
+		if taskID == "task-1" {
+			once.Do(func() {
+				_, ok := b.tombstones()[key]
+				tombstoned.Store(ok)
+				seen.Store(true)
+			})
 		}
 	}
 	jobs := newFakeJobs(-1)
