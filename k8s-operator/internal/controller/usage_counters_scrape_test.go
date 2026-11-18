@@ -21,7 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"net/http/httptrace"
 	"reflect"
 	"slices"
 	"strconv"
@@ -785,17 +785,50 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		}
 	})
 	t.Run("an errServerClosedIdle race on an immediate close", func(t *testing.T) {
-		// When persistConn.readLoop's 1-byte peek observes EOF before roundTrip
-		// increments numExpectedResponses, net/http wraps its unexported
-		// errServerClosedIdle in a *url.Error without io.EOF or *net.OpError.
-		err := &url.Error{Op: "Get", URL: "http://127.0.0.1/metrics", Err: errors.New(usageErrServerClosedIdle)}
-		if got := usageConnectKind(err); got != usageScrapeKindConnect {
+		// Pause Transport.getConn in GotConn -- after dialConn spawns
+		// persistConn.readLoop and before persistConn.roundTrip increments
+		// numExpectedResponses -- until readLoop's 1-byte peek observes EOF and
+		// closes the client connection with net/http's unexported
+		// errServerClosedIdle.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		peerClosed := make(chan struct{})
+		go func() {
+			defer close(peerClosed)
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}()
+		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				<-peerClosed
+				deadline := time.Now().Add(time.Second)
+				for time.Now().Before(deadline) {
+					if errors.Is(info.Conn.SetDeadline(time.Time{}), net.ErrClosed) {
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+				t.Error("timed out waiting for persistConn.readLoop to close the connection with errServerClosedIdle")
+			},
+		})
+		_, err = newPodUsageSource().Scrape(ctx, ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+		if err == nil {
+			t.Fatal("a peer that closed immediately scraped successfully")
+		}
+		if got := scrapeKind(t, err); got != usageScrapeKindConnect {
 			t.Errorf("kind = %q, want %q", got, usageScrapeKindConnect)
 		}
 	})
-	t.Run("a non-HTTP peer whose status line quotes errServerClosedIdle", func(t *testing.T) {
+	t.Run("a peer whose malformed header quotes errServerClosedIdle", func(t *testing.T) {
 		// Exact unwrapped matching ensures a peer that sends the idle-close
-		// string as a malformed status line still classifies as malformed.
+		// string inside a malformed HTTP header (quoted by net/http's
+		// badStringError) still classifies as malformed rather than connect.
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -806,12 +839,12 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			if err != nil {
 				return
 			}
-			_, _ = conn.Write([]byte("JUNK " + usageErrServerClosedIdle + "\r\n\r\n"))
-			conn.Close()
+			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: " + usageErrServerClosedIdle + "\r\n\r\n"))
+			_ = conn.Close()
 		}()
 		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
 		if err == nil {
-			t.Fatal("a non-HTTP peer scraped successfully")
+			t.Fatal("a peer with a malformed Content-Length header scraped successfully")
 		}
 		if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
 			t.Errorf("kind = %q, want %q: peer bytes containing %q must not spoof a connect failure", got, usageScrapeKindMalformed, usageErrServerClosedIdle)

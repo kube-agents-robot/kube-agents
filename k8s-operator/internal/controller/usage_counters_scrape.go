@@ -740,8 +740,9 @@ func usageConnectKind(err error) string {
 // usageIsServerClosedIdle reports whether err or an error in its unwrap chain
 // has the exact text of net/http's unexported errServerClosedIdle. It matches
 // the exact unwrapped error string rather than a substring so a peer that
-// puts the phrase in a malformed HTTP status line (net/http's badStringError)
-// cannot classify as a connection failure.
+// puts the phrase in a malformed HTTP response header (which net/http quotes
+// in badStringError or textproto.ProtocolError) cannot classify as a
+// connection failure.
 func usageIsServerClosedIdle(err error) bool {
 	for ; err != nil; err = errors.Unwrap(err) {
 		if err.Error() == usageErrServerClosedIdle {
