@@ -69,6 +69,12 @@ _RESET_SETTLE_SECONDS = 0.5
 # fixed sleep.
 _POLL_SECONDS = 0.01
 
+# How long the delayed-refusal regression test stalls _count_refusal after
+# _deliver_refusal finishes on the final burst refusal: half of
+# _RESET_SETTLE_SECONDS, so a fixed settle sleep started when the client read
+# 503 expires while _last_refusal_at is still inside the quiet interval.
+_DELAYED_REFUSAL_COUNT_SECONDS = 0.25
+
 # A request body that cannot sit entirely in the kernel's socket buffers, and so
 # is still being written when a handler that does not read it closes. Below that
 # threshold the write completes, the close is orderly, and the response arrives
@@ -15365,11 +15371,6 @@ _SHORT_IDLE_SECONDS = 0.5
 # closed first and the second peer admitted in its place, held for a request
 # it never sends, and closed unanswered, where the test expects the cap's 503.
 _DOOR_IDLE_SECONDS = 4 * _RESET_SETTLE_SECONDS
-# The bound on the health listener's answer under saturation. What the test
-# rules out is the answer waiting behind the four holders, parked for the idle
-# timeout (seconds); an order of magnitude under that, and not the issue's 50 ms,
-# which pins scheduler noise on a loaded runner rather than the property.
-_HEALTH_ANSWER_SECONDS = 1
 # Refusals made in quick succession, to show the cap writes one line for them.
 _REFUSAL_BURST = 3
 # The small cap the saturation test builds its server with.
@@ -15944,6 +15945,30 @@ class ThreadCapTest(_CredentialedUnixServer):
         self.assertTrue(slots.acquire(timeout=_CLOSE_WAIT_SECONDS), f"no slot was given back within {_CLOSE_WAIT_SECONDS}s")
         slots.release()
 
+    def _wait_until_saturated(self):
+        """Block until the accept loop has admitted a connection into every slot; fail at _CLOSE_WAIT_SECONDS."""
+        deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+        while self.server._cap_slots._value != 0:
+            if time.monotonic() > deadline:
+                self.fail(
+                    f"server still had {self.server._cap_slots._value} free slot(s) after {_CLOSE_WAIT_SECONDS}s"
+                )
+            time.sleep(_POLL_SECONDS)
+
+    def _wait_for_refusals_counted(self, expected=_REFUSAL_BURST - 1):
+        """Block until the accept loop has recorded ``expected`` refusals since the last log line."""
+        deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+        while True:
+            with self.server._refused_lock:
+                counted = self.server._refused
+            if counted == expected:
+                return
+            if time.monotonic() > deadline:
+                self.fail(
+                    f"expected {expected} counted refusal(s) within {_CLOSE_WAIT_SECONDS}s, got {counted}"
+                )
+            time.sleep(_POLL_SECONDS)
+
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
@@ -15951,32 +15976,40 @@ class ThreadCapTest(_CredentialedUnixServer):
         # Four handlers blocked: each holds its thread waiting for a request
         # line that never comes.
         holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
-        time.sleep(_RESET_SETTLE_SECONDS)
+        self._wait_until_saturated()
         # A burst inside one interval is one line; then, with the interval
         # shortened, a holder closing after a quiet interval ends the episode.
-        with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _CLOSE_WAIT_SECONDS):
-            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-                for _ in range(_REFUSAL_BURST):
-                    status, headers, body = self._refused()
-                    self.assertEqual(
-                        (503, str(credential_proxy.THREAD_CAP_RETRY_AFTER_SECONDS), "0", "close", b""),
-                        (status, headers.get("retry-after"), headers.get("content-length"), headers.get("connection"), body),
-                    )
-            alerts = [line for line in logs.output if "ALERT" in line and credential_proxy.MAX_THREADS_ENV in line]
-            self.assertEqual(1, len(alerts), f"one line for a burst of {_REFUSAL_BURST} refusals, not one each: {logs.output}")
-            self.assertEqual(len(alerts), len(logs.output), logs.output)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            for _ in range(_REFUSAL_BURST):
+                status, headers, body = self._refused()
+                self.assertEqual(
+                    (503, str(credential_proxy.THREAD_CAP_RETRY_AFTER_SECONDS), "0", "close", b""),
+                    (status, headers.get("retry-after"), headers.get("content-length"), headers.get("connection"), body),
+                )
+            self._wait_for_refusals_counted()
+        alerts = [line for line in logs.output if "ALERT" in line and credential_proxy.MAX_THREADS_ENV in line]
+        self.assertEqual(1, len(alerts), f"one line for a burst of {_REFUSAL_BURST} refusals, not one each: {logs.output}")
+        self.assertEqual(len(alerts), len(logs.output), logs.output)
 
-            started = time.monotonic()
-            with urllib.request.urlopen(f"http://127.0.0.1:{health.server_port}/healthz", timeout=_CLOSE_WAIT_SECONDS) as response:
-                self.assertEqual((200, {"status": "ok"}), (response.status, json.loads(response.read())))
-            self.assertLess(time.monotonic() - started, _HEALTH_ANSWER_SECONDS)
+        with urllib.request.urlopen(f"http://127.0.0.1:{health.server_port}/healthz", timeout=_CLOSE_WAIT_SECONDS) as response:
+            self.assertEqual((200, {"status": "ok"}), (response.status, json.loads(response.read())))
 
         # A slot comes back when a holder goes; the episode is reported
         # over only once an interval has passed with no refusal. The closed
         # holder's handler writes that line as it returns, so the test waits
         # for the line, inside the shortened interval, rather than sleeping.
         with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
-            time.sleep(_RESET_SETTLE_SECONDS)
+            deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+            while True:
+                with self.server._refused_lock:
+                    quiet_elapsed = time.monotonic() - self.server._last_refusal_at
+                if quiet_elapsed >= _RESET_SETTLE_SECONDS:
+                    break
+                if time.monotonic() > deadline:
+                    self.fail(
+                        f"quiet interval of {_RESET_SETTLE_SECONDS}s did not elapse within {_CLOSE_WAIT_SECONDS}s"
+                    )
+                time.sleep(_POLL_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 holders[0].close()
                 deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
@@ -15991,9 +16024,52 @@ class ThreadCapTest(_CredentialedUnixServer):
         self.send(served, "GET", "/healthz")
         self.assertEqual(200, self.response(served)[0])
 
+    def test_release_is_logged_when_last_burst_refusal_count_lags_delivery(self):
+        # _deliver_refusal runs on its own thread before the accept loop runs
+        # _count_refusal and updates _last_refusal_at. When the accept loop is
+        # descheduled after starting the final burst refusal's thread, the
+        # client reads 503 and EOF before _last_refusal_at is recorded; waiting
+        # on _refused and _last_refusal_at keeps connection_released outside
+        # the quiet interval.
+        real_deliver = self.server._deliver_refusal
+        real_count = self.server._count_refusal
+        last_delivered = threading.Event()
+        deliver_lock = threading.Lock()
+        delivered_calls = 0
+        counted_calls = 0
+
+        def tracking_deliver(request):
+            nonlocal delivered_calls
+            with deliver_lock:
+                delivered_calls += 1
+                call_index = delivered_calls
+            try:
+                return real_deliver(request)
+            finally:
+                if call_index == _REFUSAL_BURST:
+                    last_delivered.set()
+
+        def lagging_count(answered):
+            nonlocal counted_calls
+            counted_calls += 1
+            if counted_calls == _REFUSAL_BURST:
+                self.assertTrue(
+                    last_delivered.wait(_CLOSE_WAIT_SECONDS),
+                    "final burst refusal was not delivered before _count_refusal",
+                )
+                time.sleep(_DELAYED_REFUSAL_COUNT_SECONDS)
+            return real_count(answered)
+
+        with (
+            mock.patch.object(self.server, "_deliver_refusal", side_effect=tracking_deliver),
+            mock.patch.object(self.server, "_count_refusal", side_effect=lagging_count),
+        ):
+            self.test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers()
+        self.assertEqual(_REFUSAL_BURST, counted_calls)
+
     def test_a_refused_peer_that_holds_its_connection_does_not_hold_the_accept_loop(self):
         holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
-        time.sleep(_RESET_SETTLE_SECONDS)
+        self._wait_until_saturated()
         with mock.patch.object(credential_proxy, "THREAD_CAP_REFUSAL_SECONDS", _LONG_REFUSAL_DRAIN_SECONDS):
             # Refused peers that read their answer and neither close nor send:
             # each drain is parked for longer than any read below may wait.
@@ -16013,7 +16089,7 @@ class ThreadCapTest(_CredentialedUnixServer):
             served.close()
             self._wait_for_a_free_slot(self.server._cap_slots)
             holders[0] = self.connect()  # the slot is held again
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_until_saturated()
             # Past THREAD_CAP_REFUSAL_THREADS parked drains, a refused
             # connection is closed at once and unanswered rather than queued
             # behind a peer that will not close; reading it is EOF or a reset.
@@ -16133,7 +16209,7 @@ class ThreadCapTest(_CredentialedUnixServer):
         # Every slot is still there: a full cap of holders is admitted, and
         # the last of them is served rather than refused.
         holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
-        time.sleep(_RESET_SETTLE_SECONDS)
+        self._wait_until_saturated()
         self.send(holders[-1], "GET", "/healthz")
         self.assertEqual(200, self.response(holders[-1])[0])
         self.assertEqual(503, self._refused()[0])
