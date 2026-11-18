@@ -439,6 +439,47 @@ func TestConcurrentPresentationsOfOneTokenShareOneReview(t *testing.T) {
 	}
 }
 
+// A presentation can miss the initial cache check while an earlier review is
+// in flight and enter singleflight just after that review caches its answer and
+// leaves the group. Re-checking the cache inside the singleflight callback
+// returns the remembered answer instead of firing a second TokenReview.
+func TestAPresentationThatMissesTheCacheWhileAReviewFinishesUsesItsAnswer(t *testing.T) {
+	c, reviews := countingReviewer(t, boundToPod(gatewaySA, "chat-otter-1a2b", "uid-1234", testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+	clock := time.Date(2026, time.November, 2, 1, 0, 0, 0, time.UTC)
+	v.now = func() time.Time { return clock }
+
+	first, source, err := v.validate(context.Background(), "a-token")
+	if err != nil || source != reviewFresh {
+		t.Fatalf("first presentation = %+v, %q, %v; want a fresh review", first, source, err)
+	}
+
+	// Simulate the handoff window: the caller's initial v.remembered(key)
+	// reads an expired entry, and before its singleflight callback runs,
+	// the finishing review populates v.cache[key].
+	key := v.cacheKey("a-token")
+	v.cache[key] = cachedReview{att: first, expires: clock}
+	checks := 0
+	v.now = func() time.Time {
+		checks++
+		if checks == 1 {
+			v.cache[key] = cachedReview{att: first, expires: clock.Add(reviewCacheTTL)}
+		}
+		return clock
+	}
+
+	got, source, err := v.validate(context.Background(), "a-token")
+	if err != nil || source != reviewCached {
+		t.Fatalf("presentation across handoff = %+v, %q, %v; want the remembered answer", got, source, err)
+	}
+	if got != first {
+		t.Errorf("the remembered answer %+v differs from the reviewed one %+v", got, first)
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d; want 1, the handoff window must not fire a second review", got)
+	}
+}
+
 // Distinct tokens are distinct reviews: the memory is keyed by the token, and
 // one pod's attestation is never handed to another's presentation.
 func TestDistinctTokensAreReviewedSeparately(t *testing.T) {

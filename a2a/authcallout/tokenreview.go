@@ -87,6 +87,13 @@ type cachedReview struct {
 	expires time.Time
 }
 
+// reviewed is the result carried out of one singleflight call: the attestation
+// and whether it came from the cache or a fresh TokenReview.
+type reviewed struct {
+	att    Attested
+	source reviewSource
+}
+
 // NewTokenValidator builds a validator bound to one audience.
 //
 // The audience is not optional and it is not decoration. A TokenReview that
@@ -171,6 +178,13 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	// The review gets the decision budget of its own from the moment it
 	// starts.
 	results := v.group.DoChan(string(key[:]), func() (any, error) {
+		// Re-check the cache inside singleflight: a presentation that
+		// missed v.remembered above while an earlier review was in
+		// flight can enter DoChan just after that review stored its
+		// answer and left the group.
+		if att, ok := v.remembered(key); ok {
+			return reviewed{att: att, source: reviewCached}, nil
+		}
 		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authDecisionBudget)
 		defer cancel()
 		att, err := v.review(reviewCtx, token)
@@ -178,14 +192,15 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 			return nil, err
 		}
 		v.remember(key, att)
-		return att, nil
+		return reviewed{att: att, source: reviewFresh}, nil
 	})
 	select {
 	case r := <-results:
 		if r.Err != nil {
 			return Attested{}, "", r.Err
 		}
-		return r.Val.(Attested), reviewFresh, nil
+		out := r.Val.(reviewed)
+		return out.att, out.source, nil
 	case <-ctx.Done():
 		return Attested{}, "", fmt.Errorf("TokenReview call failed: %w", ctx.Err())
 	}
