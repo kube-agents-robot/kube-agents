@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -803,6 +804,49 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindBodyTimeout)
 		}
 	})
+}
+
+// When a peer closes a newly dialed connection before persistConn.roundTrip
+// increments numExpectedResponses, net/http's readLoop closes the connection
+// with unexported errServerClosedIdle ("http: server closed idle connection")
+// rather than io.EOF. usageConnectKind classifies bare and wrapped
+// errServerClosedIdle errors as usageScrapeKindConnect, while a malformed
+// status line from the peer containing that phrase still classifies as
+// usageScrapeKindMalformed.
+func TestUsageConnectKind_ServerClosedIdle(t *testing.T) {
+	bare := errors.New(usageErrServerClosedIdle)
+	if got := usageConnectKind(bare); got != usageScrapeKindConnect {
+		t.Errorf("bare errServerClosedIdle: kind = %q, want %q", got, usageScrapeKindConnect)
+	}
+	wrapped := &url.Error{Op: "Get", URL: "http://127.0.0.1:8080/metrics", Err: fmt.Errorf("transport: %w", bare)}
+	if got := usageConnectKind(wrapped); got != usageScrapeKindConnect {
+		t.Errorf("wrapped errServerClosedIdle: kind = %q, want %q", got, usageScrapeKindConnect)
+	}
+	spoofed := &url.Error{Op: "Get", URL: "http://127.0.0.1:8080/metrics", Err: fmt.Errorf("malformed HTTP response %q", usageErrServerClosedIdle)}
+	if got := usageConnectKind(spoofed); got != usageScrapeKindMalformed {
+		t.Errorf("parse error quoting peer bytes: kind = %q, want %q", got, usageScrapeKindMalformed)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte(usageErrServerClosedIdle + "\r\n\r\n"))
+		conn.Close()
+	}()
+	_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+	if err == nil {
+		t.Fatal("a peer answering with the sentinel text scraped successfully")
+	}
+	if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
+		t.Errorf("peer sending sentinel text: kind = %q, want %q", got, usageScrapeKindMalformed)
+	}
 }
 
 // A line past the bound in a family the poller does not read is skipped, not a
