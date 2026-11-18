@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -811,8 +812,8 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 // with unexported errServerClosedIdle ("http: server closed idle connection")
 // rather than io.EOF. usageConnectKind classifies bare and wrapped
 // errServerClosedIdle errors as usageScrapeKindConnect, while a malformed
-// status line from the peer containing that phrase still classifies as
-// usageScrapeKindMalformed.
+// response from the peer whose net/http parse error contains that full phrase
+// still classifies as usageScrapeKindMalformed.
 func TestUsageConnectKind_ServerClosedIdle(t *testing.T) {
 	bare := errors.New(usageErrServerClosedIdle)
 	if got := usageConnectKind(bare); got != usageScrapeKindConnect {
@@ -827,6 +828,12 @@ func TestUsageConnectKind_ServerClosedIdle(t *testing.T) {
 		t.Errorf("parse error quoting peer bytes: kind = %q, want %q", got, usageScrapeKindMalformed)
 	}
 
+	rawResp := "HTTP/1.1 200 OK\r\n " + usageErrServerClosedIdle + "\r\n\r\n"
+	_, parseErr := http.ReadResponse(bufio.NewReader(strings.NewReader(rawResp)), nil)
+	if parseErr == nil || !strings.Contains(parseErr.Error(), usageErrServerClosedIdle) {
+		t.Fatalf("http.ReadResponse error = %v, want an error containing %q", parseErr, usageErrServerClosedIdle)
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -837,15 +844,16 @@ func TestUsageConnectKind_ServerClosedIdle(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_, _ = conn.Write([]byte(usageErrServerClosedIdle + "\r\n\r\n"))
-		conn.Close()
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = conn.Write([]byte(rawResp))
 	}()
 	_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
 	if err == nil {
-		t.Fatal("a peer answering with the sentinel text scraped successfully")
+		t.Fatal("a peer answering with a malformed header containing the sentinel text scraped successfully")
 	}
 	if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
-		t.Errorf("peer sending sentinel text: kind = %q, want %q", got, usageScrapeKindMalformed)
+		t.Errorf("peer sending sentinel text in malformed header: kind = %q, want %q", got, usageScrapeKindMalformed)
 	}
 }
 
