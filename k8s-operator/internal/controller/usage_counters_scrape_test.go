@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -733,29 +734,36 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 	})
 	t.Run("a peer that is not HTTP", func(t *testing.T) {
 		// What answers on the port is input: the error kind names no byte of
-		// the junk status line.
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer ln.Close()
-		go func() {
-			conn, err := ln.Accept()
+		// the junk status line, even when the peer echoes net/http's
+		// closed-idle sentinel text in its status or header line.
+		for _, raw := range []string{
+			"JUNK SECRET-STATUS-LINE\r\n\r\n",
+			usageServerClosedIdleErr + "\r\n\r\n",
+			"HTTP/1.1 200 " + usageServerClosedIdleErr + "\r\n " + usageServerClosedIdleErr + "\r\n\r\n",
+		} {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
-				return
+				t.Fatal(err)
 			}
-			_, _ = conn.Write([]byte("JUNK SECRET-STATUS-LINE\r\n\r\n"))
-			conn.Close()
-		}()
-		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
-		if err == nil {
-			t.Fatal("a non-HTTP peer scraped successfully")
-		}
-		if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "JUNK") {
-			t.Errorf("the error text carries the peer's bytes: %q", err.Error())
-		}
-		if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
-			t.Errorf("kind = %q, want %q: the connection succeeded and the peer answered junk", got, usageScrapeKindMalformed)
+			defer ln.Close()
+			go func(payload string) {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_, _ = conn.Write([]byte(payload))
+				conn.Close()
+			}(raw)
+			_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+			if err == nil {
+				t.Fatalf("a non-HTTP peer (%q) scraped successfully", raw)
+			}
+			if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "JUNK") || strings.Contains(err.Error(), usageServerClosedIdleErr) {
+				t.Errorf("the error text carries the peer's bytes: %q", err.Error())
+			}
+			if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
+				t.Errorf("kind for %q = %q, want %q: the connection succeeded and the peer answered junk", raw, got, usageScrapeKindMalformed)
+			}
 		}
 	})
 	t.Run("a peer that accepts then closes before a byte", func(t *testing.T) {
@@ -781,6 +789,29 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		}
 		if got := scrapeKind(t, err); got != usageScrapeKindConnect {
 			t.Errorf("kind = %q, want %q: the peer accepted and closed without answering", got, usageScrapeKindConnect)
+		}
+		// When persistConn.readLoop's initial Peek(1) sees io.EOF before
+		// roundTrip increments numExpectedResponses, client.Do wraps
+		// net/http's unexported errServerClosedIdle in *url.Error rather
+		// than mapping io.ErrUnexpectedEOF to io.EOF.
+		closedIdle := &url.Error{
+			Op:  http.MethodGet,
+			URL: usageScrapeScheme + ln.Addr().String() + usageMetricsPath,
+			Err: errors.New(usageServerClosedIdleErr),
+		}
+		if got := usageConnectKind(closedIdle); got != usageScrapeKindConnect {
+			t.Errorf("usageConnectKind(%v) = %q, want %q", closedIdle, got, usageScrapeKindConnect)
+		}
+		// A malformed-response error that quotes the closed-idle sentinel
+		// string (rather than having errServerClosedIdle as its unwrapped
+		// leaf error) still classifies as malformed response.
+		quotedSentinel := &url.Error{
+			Op:  http.MethodGet,
+			URL: usageScrapeScheme + ln.Addr().String() + usageMetricsPath,
+			Err: fmt.Errorf("malformed HTTP response %q", usageServerClosedIdleErr),
+		}
+		if got := usageConnectKind(quotedSentinel); got != usageScrapeKindMalformed {
+			t.Errorf("usageConnectKind(%v) = %q, want %q", quotedSentinel, got, usageScrapeKindMalformed)
 		}
 	})
 	t.Run("a listener that stalls mid-body", func(t *testing.T) {

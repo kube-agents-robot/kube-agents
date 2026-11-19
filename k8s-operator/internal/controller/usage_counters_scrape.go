@@ -312,6 +312,10 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+	// usageServerClosedIdleErr is net/http's unexported errServerClosedIdle
+	// sentinel text, raised when persistConn.readLoop sees io.EOF on its
+	// initial Peek(1) before roundTrip increments numExpectedResponses.
+	usageServerClosedIdleErr = "http: server closed idle connection"
 )
 
 var (
@@ -725,10 +729,32 @@ func usageConnectKind(err error) string {
 	if errors.As(err, &opErr) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, io.EOF) {
+		errors.Is(err, io.EOF) ||
+		usageServerClosedIdle(err) {
 		return usageScrapeKindConnect
 	}
 	return usageScrapeKindMalformed
+}
+
+// usageServerClosedIdle reports whether err's unwrapped leaf error is
+// net/http's unexported errServerClosedIdle sentinel. When a peer accepts a TCP
+// connection and closes it before sending a byte, persistConn.readLoop can see
+// io.EOF on its initial Peek(1) before persistConn.roundTrip increments
+// numExpectedResponses; readLoopPeekFailLocked then records errServerClosedIdle
+// rather than io.ErrUnexpectedEOF (which mapRoundTripError maps to io.EOF).
+// Matching only the leaf error's exact text keeps a malformed-response error
+// that quotes the sentinel string classified as usageScrapeKindMalformed.
+func usageServerClosedIdle(err error) bool {
+	if err == nil {
+		return false
+	}
+	for {
+		unwrapped := errors.Unwrap(err)
+		if unwrapped == nil {
+			return err.Error() == usageServerClosedIdleErr
+		}
+		err = unwrapped
+	}
 }
 
 // usageTimedOut reports whether err is a deadline or a network timeout, which
