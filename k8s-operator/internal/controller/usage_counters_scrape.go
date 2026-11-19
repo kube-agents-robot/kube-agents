@@ -740,10 +740,12 @@ func usageConnectKind(err error) string {
 // net/http's unexported errServerClosedIdle sentinel. When a peer accepts a TCP
 // connection and closes it before sending a byte, persistConn.readLoop can see
 // io.EOF on its initial Peek(1) before persistConn.roundTrip increments
-// numExpectedResponses; readLoopPeekFailLocked then records errServerClosedIdle
-// rather than io.ErrUnexpectedEOF (which mapRoundTripError maps to io.EOF).
-// Matching only the leaf error's exact text keeps a malformed-response error
-// that quotes the sentinel string classified as usageScrapeKindMalformed.
+// numExpectedResponses; readLoopPeekFailLocked then closes the connection with
+// errServerClosedIdle rather than taking the numExpectedResponses > 0 path that
+// sends transportReadFromServerError{err: io.EOF} (unwrapped to io.EOF by
+// Transport.roundTrip). Matching only the leaf error's exact text keeps a
+// malformed-response error that quotes the sentinel string classified as
+// usageScrapeKindMalformed.
 func usageServerClosedIdle(err error) bool {
 	if err == nil {
 		return false

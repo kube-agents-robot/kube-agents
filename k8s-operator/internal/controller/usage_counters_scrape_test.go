@@ -791,9 +791,10 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			t.Errorf("kind = %q, want %q: the peer accepted and closed without answering", got, usageScrapeKindConnect)
 		}
 		// When persistConn.readLoop's initial Peek(1) sees io.EOF before
-		// roundTrip increments numExpectedResponses, client.Do wraps
-		// net/http's unexported errServerClosedIdle in *url.Error rather
-		// than mapping io.ErrUnexpectedEOF to io.EOF.
+		// roundTrip increments numExpectedResponses, readLoopPeekFailLocked
+		// records net/http's unexported errServerClosedIdle (wrapped in
+		// *url.Error by client.Do) instead of returning io.EOF via
+		// transportReadFromServerError.
 		closedIdle := &url.Error{
 			Op:  http.MethodGet,
 			URL: usageScrapeScheme + ln.Addr().String() + usageMetricsPath,
