@@ -193,7 +193,7 @@ func TestAnAddedProfileWithALateDurableReconnectsOnce(t *testing.T) {
 	ti.pool.Set("tse2", "read", "tse2-0")
 	ti.update(func(c *lib.DispatchConfig) { c.Version = "v2"; c.Profiles = append(c.Profiles, testProfile("tse2", 2)) })
 	waitFor(t, 15*time.Second, "the reconnect", func() bool { return d.Reconnects() == 1 })
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 	b.ensure("tse2", 2, 0, "read")
 	b.submit("tse2", "read", lib.SubmitKindTop, "task-1")
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted {

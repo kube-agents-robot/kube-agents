@@ -353,6 +353,28 @@ func TestHeldConfigIsRefusedWhenIncomplete(t *testing.T) {
 	}
 }
 
+// expireOnRetryCtx lets the backoff select proceed and expires the context
+// before the next s.start call, so a test can deterministically hit a caller
+// deadline firing during a retry request rather than during the backoff wait.
+type expireOnRetryCtx struct {
+	context.Context
+	expired atomic.Bool
+}
+
+func (c *expireOnRetryCtx) Done() <-chan struct{} {
+	if !c.expired.Load() {
+		return nil
+	}
+	return c.Context.Done()
+}
+
+func (c *expireOnRetryCtx) Err() error {
+	if !c.expired.Load() {
+		return nil
+	}
+	return c.Context.Err()
+}
+
 // Workers bind and never create: with no durable there is nothing to bind,
 // and the error says the operator creates it.
 func TestSubscribeHeldNeverCreatesTheDurable(t *testing.T) {
@@ -365,8 +387,25 @@ func TestSubscribeHeldNeverCreatesTheDurable(t *testing.T) {
 	if err == nil {
 		t.Fatal("bound to a durable that does not exist")
 	}
-	if !strings.Contains(err.Error(), "operator creates it") {
-		t.Errorf("error = %v, want it to say the operator creates the durable", err)
+	if !errors.Is(err, jetstream.ErrConsumerNotFound) || !strings.Contains(err.Error(), "operator creates it") {
+		t.Errorf("error = %v, want ErrConsumerNotFound saying the operator creates the durable", err)
+	}
+
+	// When the caller's deadline fires right before a retry's lookup request
+	// rather than during the backoff wait, the previous attempt's not-found
+	// error is still returned rather than overwritten with ctx.Err().
+	expired, cancelExpired := context.WithTimeout(h.ctx, 0)
+	defer cancelExpired()
+	retryCtx := &expireOnRetryCtx{Context: expired}
+	oldBackoff := bindBackoff
+	t.Cleanup(func() { bindBackoff = oldBackoff })
+	bindBackoff = func(int) time.Duration {
+		retryCtx.expired.Store(true)
+		return 0
+	}
+	_, err = worker.SubscribeHeld(retryCtx, h.cfg(), func(context.Context, Delivery) {})
+	if !errors.Is(err, jetstream.ErrConsumerNotFound) || !strings.Contains(err.Error(), "operator creates it") {
+		t.Errorf("error when context expires on retry = %v, want ErrConsumerNotFound saying the operator creates the durable", err)
 	}
 }
 

@@ -745,9 +745,10 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // One error is not retried at all: a held bind refused on the durable's
 // stored config (ErrHeldBindRefused). That verdict was read from the
 // consumer the server already holds, so a retry reads the same one, and
-// retrying it for the window would hand the caller whichever error the last
-// attempt happened to end on (the context's, when a caller's deadline fires
-// mid-retry) in place of the refusal. A missing durable keeps the window.
+// retrying it for the window would delay the refusal for no reason. A
+// missing durable keeps the window; when a caller's deadline fires
+// mid-retry after at least one completed attempt, the last completed
+// attempt's error is returned rather than overwritten with the context's.
 //
 // With cfg.WaitForStream, a missing stream does not count against the
 // window, and neither does a lost connection (connectionLost, or the
@@ -771,6 +772,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 	deadline := time.Now().Add(subscribeBindWindow)
 	var waitStart, lastLog time.Time
 	var lastWaitingFor string
+	var lastErr error
 	warned := 0
 	for attempt := 1; ; attempt++ {
 		err := s.start(ctx, js)
@@ -796,6 +798,10 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		if errors.Is(err, ErrHeldBindRefused) {
 			return err
 		}
+		if lastErr != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return lastErr
+		}
+		lastErr = err
 		// What a WaitForStream bind is waiting for, if anything: the stream,
 		// or the connection. Whether the stream exists is unknown while the
 		// connection is down, so an outage does not count against the window
