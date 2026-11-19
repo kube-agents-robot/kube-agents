@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -757,6 +758,24 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
 			t.Errorf("kind = %q, want %q: the connection succeeded and the peer answered junk", got, usageScrapeKindMalformed)
 		}
+		// A peer whose junk status line embeds net/http's idle-close string
+		// still classifies as malformed response, not connect.
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Read(make([]byte, 1024))
+			_, _ = conn.Write([]byte("JUNK " + usageIdleCloseError + "\r\n\r\n"))
+			conn.Close()
+		}()
+		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+		if err == nil {
+			t.Fatal("a non-HTTP peer embedding idle-close text scraped successfully")
+		}
+		if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
+			t.Errorf("kind = %q, want %q: a peer status line embedding %q is still a malformed response", got, usageScrapeKindMalformed, usageIdleCloseError)
+		}
 	})
 	t.Run("a peer that accepts then closes before a byte", func(t *testing.T) {
 		// Accept and drop the connection without answering -- a reset, a broken
@@ -781,6 +800,17 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		}
 		if got := scrapeKind(t, err); got != usageScrapeKindConnect {
 			t.Errorf("kind = %q, want %q: the peer accepted and closed without answering", got, usageScrapeKindConnect)
+		}
+		// Deterministically exercise the readLoop race where net/http sees the
+		// peer's FIN before roundTrip increments numExpectedResponses and
+		// returns its unexported errServerClosedIdle wrapped in *url.Error.
+		idleClose := &url.Error{
+			Op:  http.MethodGet,
+			URL: usageScrapeScheme + ln.Addr().String() + usageMetricsPath,
+			Err: errors.New(usageIdleCloseError),
+		}
+		if got := usageConnectKind(idleClose); got != usageScrapeKindConnect {
+			t.Errorf("usageConnectKind(%v) = %q, want %q", idleClose, got, usageScrapeKindConnect)
 		}
 	})
 	t.Run("a listener that stalls mid-body", func(t *testing.T) {

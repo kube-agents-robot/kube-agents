@@ -312,6 +312,10 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+	// usageIdleCloseError is net/http's unexported errServerClosedIdle text,
+	// raised when a newly dialed connection's readLoop sees EOF before
+	// roundTrip increments numExpectedResponses.
+	usageIdleCloseError = "http: server closed idle connection"
 )
 
 var (
@@ -725,10 +729,26 @@ func usageConnectKind(err error) string {
 	if errors.As(err, &opErr) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, io.EOF) {
+		errors.Is(err, io.EOF) ||
+		usageIsIdleClose(err) {
 		return usageScrapeKindConnect
 	}
 	return usageScrapeKindMalformed
+}
+
+// usageIsIdleClose reports whether err wraps net/http's unexported
+// errServerClosedIdle: dialConn starts persistConn.readLoop before roundTrip
+// increments numExpectedResponses, so an immediate peer FIN on a fresh
+// connection can replace io.EOF with errServerClosedIdle. Exact equality on
+// each unwrapped error prevents peer-supplied status or header bytes quoted by
+// net/http parse errors from matching.
+func usageIsIdleClose(err error) bool {
+	for u := err; u != nil; u = errors.Unwrap(u) {
+		if u.Error() == usageIdleCloseError {
+			return true
+		}
+	}
+	return false
 }
 
 // usageTimedOut reports whether err is a deadline or a network timeout, which
