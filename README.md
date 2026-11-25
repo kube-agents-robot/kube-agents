@@ -206,3 +206,5 @@ Bug reports and feature requests go in [issues](https://github.com/gke-labs/kube
 This is not an officially supported Google product.
 
 This project is not eligible for the Google Open Source Software Vulnerability Rewards Program.
+
+This fork is the robot's staging repository.
