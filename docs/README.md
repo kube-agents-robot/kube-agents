@@ -100,7 +100,11 @@ kube-agents/
 
 The published documentation site is built from `docs/site/src/content/docs/`
 and served from GitHub Pages at <https://gke-labs.github.io/kube-agents/>
-(Astro `base: '/kube-agents'`).
+(Astro `base: '/kube-agents'`). The contributor robot (`kube-agents-robot`, run
+from `gke-labs/kube-agents-robot`; see [`docs/ownership.md`](ownership.md) under
+"Areas, services and roles") stages its pull-request branches in its fork at
+<https://github.com/kube-agents-robot/kube-agents>
+(`kube-agents-robot/kube-agents`).
 
 ## 2. Canonical homes, generated regions, and identifier sources
 
